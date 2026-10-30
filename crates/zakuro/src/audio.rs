@@ -9,6 +9,10 @@ use cpal::{FromSample, SampleFormat, SizedSample};
 /// how much sound to keep waiting, in the console's samples, about 125 ms.
 /// more rides out uneven frames, less answers sooner.
 const TARGET: usize = 4096;
+/// the frames the output's callback asks for when the device lets it be
+/// pinned: macOS's own comes in small gusts, and a pinned queue steadies
+/// the pacing a second of buffer worth.
+const PINNED: usize = 2048;
 /// how much a queue that ran dry waits for before it plays again.
 const RESUME: usize = TARGET / 4;
 /// the queue stretches sound only once it is down to this, about 63 ms.
@@ -205,7 +209,11 @@ impl Audio {
         let device = host.default_output_device().ok_or("there is no sound output device")?;
         let supported = device.default_output_config().map_err(|e| e.to_string())?;
         let format = supported.sample_format();
-        let config: cpal::StreamConfig = supported.into();
+        let mut config: cpal::StreamConfig = supported.into();
+        // pin the queue's frames when the device takes it: steadier
+        // callbacks than the host's own default, comfortably under
+        // TARGET's depth so a refilling queue pins then too
+        config.buffer_size = cpal::BufferSize::Fixed(PINNED as cpal::FrameCount);
         let queue = Arc::new(Mutex::new(Queue {
             samples: VecDeque::new(),
             fraction: 0.0,
@@ -282,28 +290,47 @@ fn stream<T: SizedSample + FromSample<f32>>(
     queue: Arc<Mutex<Queue>>,
 ) -> Result<cpal::Stream, String> {
     let channels = config.channels as usize;
-    device
-        .build_output_stream(
-            config,
-            move |out: &mut [T], _| {
-                let Ok(mut queue) = queue.lock() else { return };
-                for frame in out.chunks_mut(channels) {
-                    let [left, right] = queue.next();
-                    match frame {
-                        [mono] => *mono = T::from_sample((left + right) / 2.0),
-                        [l, r, rest @ ..] => {
-                            *l = T::from_sample(left);
-                            *r = T::from_sample(right);
-                            rest.fill(T::EQUILIBRIUM);
+    let build = |config: &cpal::StreamConfig| {
+        let queue = queue.clone();
+        device
+            .build_output_stream(
+                config,
+                move |out: &mut [T], _| {
+                    let Ok(mut queue) = queue.lock() else { return };
+                    for frame in out.chunks_mut(channels) {
+                        let [left, right] = queue.next();
+                        match frame {
+                            [mono] => *mono = T::from_sample((left + right) / 2.0),
+                            [l, r, rest @ ..] => {
+                                *l = T::from_sample(left);
+                                *r = T::from_sample(right);
+                                rest.fill(T::EQUILIBRIUM);
+                            }
+                            [] => {}
                         }
-                        [] => {}
                     }
-                }
-            },
-            |error| log::warn!("sound output, {error}"),
-            None,
-        )
-        .map_err(|e| e.to_string())
+                },
+                move |error| log::warn!("sound output, {error}"),
+                None,
+            )
+            .map_err(|e| e.to_string())
+    };
+    let stream = build(config);
+    let stream = match stream {
+        Ok(stream) => stream,
+        Err(error) => {
+            // the host turned the pinned queue down, or its Fixed size was
+            // not on the menu: the device's own stays, as it always ran
+            log::info!("the output did not take a pinned queue, {error}, keeping the host's buffer");
+            let host = cpal::StreamConfig {
+                channels: config.channels,
+                sample_rate: config.sample_rate,
+                buffer_size: cpal::BufferSize::Default,
+            };
+            build(&host)?
+        }
+    };
+    Ok(stream)
 }
 
 #[cfg(test)]
