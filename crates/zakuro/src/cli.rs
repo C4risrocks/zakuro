@@ -17,6 +17,9 @@ pub struct Options {
     pub new3ds: bool,
     /// skip loading a ROM entirely and just paint both screens solid colors.
     pub test_pattern: bool,
+    /// the split-monitors spike: a second window draws the bottom screen
+    /// alone, straight from the same frames.
+    pub split_spike: bool,
     /// a library of recompiled code for the title, or a directory of them.
     pub recompiled: Option<String>,
     /// draw on the host GPU rather than in software, the settings' choice
@@ -45,6 +48,9 @@ options:
                                    the host GPU through Vulkan, or software
                                    where that does not start)
   --scale <n>                      window scale factor (default: 2)
+  --split-spike                    a second, plain window draws only the
+                                   bottom screen, from the same frames (the
+                                   split-monitors spike, no settings yet)
   (Esc opens the menu over a game, F1 pauses, F11 goes fullscreen)
   --headless <frames>              run without a window and print a report
   --new3ds                         emulate a New 3DS
@@ -77,6 +83,7 @@ pub fn parse() -> Result<Options, String> {
         profile: false,
         new3ds: false,
         test_pattern: false,
+        split_spike: false,
         recompiled: None,
         hardware_rasterizer: None,
         data: None,
@@ -128,6 +135,7 @@ pub fn parse() -> Result<Options, String> {
             "--mute" => options.mute = true,
             "--profile" => options.profile = true,
             "--test-pattern" => options.test_pattern = true,
+            "--split-spike" => options.split_spike = true,
             other if other.starts_with('-') => {
                 return Err(format!("unknown option '{other}'"));
             }

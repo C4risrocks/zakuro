@@ -115,6 +115,9 @@ pub fn run_with(linked: Option<Linked>, overlay: Option<Box<dyn GameOverlay>>) {
         gui: None,
         backend: None,
         window: None,
+        companion_backend: None,
+        companion: None,
+        companion_id: None,
         audio: None,
         mouse_down: false,
         tilting_from: None,
@@ -404,6 +407,11 @@ struct App {
     // against the window's wl_surface.
     backend: Option<Backend>,
     window: Option<Window>,
+    // the split-monitors spike: a second window with the bottom screen
+    // alone. the same drop rule applies, the backend first.
+    companion_backend: Option<Backend>,
+    companion: Option<Window>,
+    companion_id: Option<WindowId>,
     keyboard: Keyboard,
     gamepads: gamepad::Gamepads,
     audio: Option<audio::Audio>,
@@ -547,6 +555,11 @@ impl ApplicationHandler for App {
                 // the game the command line names starts on the device the
                 // presenter may lend the renderer, once there is one
                 self.start();
+                if self.options.split_spike {
+                    if let Err(error) = self.open_companion(event_loop) {
+                        log::warn!("no companion window, {error}");
+                    }
+                }
             }
             Err(error) => {
                 eprintln!("zakuro: could not start the {renderer:?} backend: {error}");
@@ -555,7 +568,21 @@ impl ApplicationHandler for App {
         }
     }
 
-    fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
+        // the companion window only resizes and closes: its keyboard never
+        // reaches the game, and the pointer's taps stay with the main one
+        if self.companion_id == Some(id) {
+            match event {
+                WindowEvent::Resized(size) => {
+                    if let Some(backend) = &mut self.companion_backend {
+                        backend.resize(size.width, size.height);
+                    }
+                }
+                WindowEvent::CloseRequested => self.close_companion(),
+                _ => {}
+            }
+            return;
+        }
         // Tab is fast forward while a game runs, not a key for moving the
         // interface's focus around
         let (tab, repeat) = match &event {
@@ -607,6 +634,9 @@ impl ApplicationHandler for App {
 
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
         if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+        if let Some(window) = &self.companion {
             window.request_redraw();
         }
     }
@@ -785,6 +815,55 @@ impl App {
         }
         self.menus.menu_open = false;
         self.keyboard.release();
+    }
+
+    /// the spike's second window: the bottom screen alone, placed on the
+    /// monitor after the main one's there is.
+    fn open_companion(&mut self, event_loop: &ActiveEventLoop) -> Result<(), String> {
+        let monitors = event_loop.available_monitors().collect::<Vec<_>>();
+        let after_main = monitors.get(1).or(monitors.last()).cloned();
+        // the bottom screen alone: a window of the bottom screen's pixels
+        let (console_width, console_height) = self.layout.screens().size(self.top_shape.width());
+        let (window_width, window_height) = (console_width * self.scale, console_height * self.scale);
+        let mut attributes = Window::default_attributes()
+            .with_title("Zakuro - bottom screen (spike)")
+            .with_inner_size(winit::dpi::LogicalSize::new(window_width, window_height));
+        if let Some(monitor) = &after_main {
+            let position = monitor.position();
+            let spot = (monitor.size().width.saturating_sub(window_width) / 2) as i32;
+            attributes = attributes.with_position(winit::dpi::LogicalPosition::new(position.x + spot, position.y + 32));
+        }
+        let drafting = attributes.clone();
+        let created = Backend::create(event_loop, attributes, RendererKind::Vulkan).or_else(|error| {
+            log::warn!("no Vulkan for the companion window, {error}");
+            Backend::create(event_loop, drafting, RendererKind::OpenGl)
+        });
+        let (window, mut backend) = created?;
+        backend.set_layout(settings::Screens::BottomOnly.screens());
+        backend.set_top_width(self.settings.top_shape.width());
+        backend.set_scaling(self.settings.filter.screens(), self.settings.integer_scale);
+        backend.set_stereo(self.settings.stereo());
+        log::info!(
+            "companion window drawing the bottom screen alone, on the {} backend{}",
+            backend.name(),
+            after_main.map_or(String::new(), |monitor| {
+                let index = monitors.iter().position(|one| *one == monitor);
+                format!(" (monitor {})", index.map_or('?'.to_string(), |one| format!("{one}")))
+            })
+        );
+        self.companion_id = Some(window.id());
+        self.companion = Some(window);
+        self.companion_backend = Some(backend);
+        Ok(())
+    }
+
+    /// the companion window closes: the main one carries the whole set of
+    /// screens again, exactly as the spike never got opened. the backend
+    /// lets go before the window does, as the drop rule above says.
+    fn close_companion(&mut self) {
+        drop(self.companion_backend.take());
+        self.companion = None;
+        self.companion_id = None;
     }
 
     fn key(&mut self, event: KeyEvent, consumed: bool) {
@@ -1673,6 +1752,25 @@ impl App {
             Err(error) => {
                 log::error!("presentation failed: {error}");
                 event_loop.exit();
+            }
+        }
+        // the spike's window: the bottom screen alone, straight from the
+        // same frames the main window just drew. the GPU-referenced images
+        // are passed to one presenter only, so the companion's copies go
+        // up from the CPU's pixels.
+        if let Some(backend) = self.companion_backend.as_mut() {
+            let result = backend.present(
+                ScreenImage { width: top_width, height: top_height, pixels: &top, gpu: None },
+                ScreenImage { width: bottom_width, height: bottom_height, pixels: &bottom, gpu: None },
+                ScreenImage { width: right_width, height: right_height, pixels: &right, gpu: None },
+                &overlay,
+            );
+            match result {
+                Ok(()) | Err(PresentError::OutOfDate) => {}
+                Err(error) => {
+                    self.close_companion();
+                    log::warn!("the companion window's presentation failed, {error}, closing it");
+                }
             }
         }
     }
