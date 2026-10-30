@@ -189,6 +189,12 @@ impl VulkanPresenter {
             || is_portability_system();
         if portability {
             extensions.push(ash::khr::portability_enumeration::NAME.as_ptr());
+            // portability drivers (MoltenVK, KosmicKrisp) may also expose the
+            // device extension VK_KHR_portability_subset, and the spec binds
+            // enabling it to get_physical_device_properties2 on the instance;
+            // prop2 is core since 1.1, so this costs nothing on macOS and is
+            // the requirement the day subset turns on (ash-examples ships both)
+            extensions.push(ash::khr::get_physical_device_properties2::NAME.as_ptr());
         }
         let instance_info = vk::InstanceCreateInfo::default()
             .application_info(&application)

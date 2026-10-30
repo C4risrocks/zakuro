@@ -5720,7 +5720,13 @@ pub(crate) fn own_device() -> Result<SharedDevice, String> {
     // the loader only enumerates a conformant portability driver (MoltenVK,
     // KosmicKrisp) for instances that opt in
     let portability = crate::backend::vulkan::is_portability_system();
-    let portability_extensions = [ash::khr::portability_enumeration::NAME.as_ptr()];
+    // props2 rides along with portability: VK_KHR_portability_subset (which
+    // only these drivers expose) is bound by spec to get_physical_device_
+    // properties2, and prop2 itself is core since 1.1 — free preventive insurance
+    let portability_extensions = [
+        ash::khr::portability_enumeration::NAME.as_ptr(),
+        ash::khr::get_physical_device_properties2::NAME.as_ptr(),
+    ];
     let instance_info = vk::InstanceCreateInfo::default()
         .application_info(&app)
         .enabled_extension_names(if portability {
