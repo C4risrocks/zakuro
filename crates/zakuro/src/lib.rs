@@ -998,6 +998,11 @@ impl App {
             if full && self.resize_after_full_screen && !self.maximized_before_full_screen {
                 let _ = window.request_inner_size(self.window_size());
             }
+            // the run of windows goes borderless together, neither screen
+            // left drowning in the desktop while the other shows the game
+            if let Some(window) = &self.companion {
+                window.set_fullscreen((!full).then_some(Fullscreen::Borderless(None)));
+            }
         }
     }
 
@@ -1057,6 +1062,13 @@ impl App {
     /// the window to them.
     fn apply_layout(&mut self) {
         if let Some(backend) = &mut self.backend {
+            backend.set_top_width(self.settings.top_shape.width());
+            backend.set_scaling(self.settings.filter.screens(), self.settings.integer_scale);
+            backend.set_stereo(self.settings.stereo());
+        }
+        // the companion keeps its one screen all the same, though the
+        // shape, the filter and the 3D still reach it
+        if let Some(backend) = self.companion_backend.as_mut() {
             backend.set_top_width(self.settings.top_shape.width());
             backend.set_scaling(self.settings.filter.screens(), self.settings.integer_scale);
             backend.set_stereo(self.settings.stereo());
