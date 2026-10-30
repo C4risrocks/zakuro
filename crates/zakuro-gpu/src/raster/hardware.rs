@@ -5715,8 +5715,25 @@ pub(crate) fn own_device() -> Result<SharedDevice, String> {
     // requirements
     let entry = unsafe { ash::Entry::load() }.map_err(|e| format!("no Vulkan loader, {e}"))?;
     let app = vk::ApplicationInfo::default().application_name(c"zakuro").api_version(vk::API_VERSION_1_3);
-    // SAFETY: a plain instance with no layers or extensions
-    let instance = unsafe { entry.create_instance(&vk::InstanceCreateInfo::default().application_info(&app), None) }
+    // SAFETY: a plain instance with no layers; macOS opt-in via portability:
+    // the flag alone is a VUID violation without its extension (06559), and
+    // the loader only enumerates a conformant portability driver (MoltenVK,
+    // KosmicKrisp) for instances that opt in
+    let portability = crate::backend::vulkan::is_portability_system();
+    let portability_extensions = [ash::khr::portability_enumeration::NAME.as_ptr()];
+    let instance_info = vk::InstanceCreateInfo::default()
+        .application_info(&app)
+        .enabled_extension_names(if portability {
+            portability_extensions.as_slice()
+        } else {
+            &[]
+        })
+        .flags(if portability {
+            vk::InstanceCreateFlags::ENUMERATE_PORTABILITY_KHR
+        } else {
+            vk::InstanceCreateFlags::empty()
+        });
+    let instance = unsafe { entry.create_instance(&instance_info, None) }
         .map_err(vk_error("create an instance"))?;
     let made = pick(&instance).and_then(|(physical, family)| render_device(&entry, &instance, physical, family, &[]));
     if made.is_err() {

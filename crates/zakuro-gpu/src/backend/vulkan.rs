@@ -12,6 +12,21 @@ use super::{place, GpuScreen, Overlay, PresentError, Presenter, ScreenFilter, Sc
 use crate::raster::hardware::{can_render, render_device};
 use crate::SharedDevice;
 
+pub(crate) fn is_portability_system() -> bool {
+    // macOS only ships Vulkan drivers behind the portability extension
+    // (MoltenVK, KosmicKrisp): the loader only enumerates a conformant
+    // portability driver for instances that opt in. Where a plain conformant
+    // driver already exists (Linux, pre-MoltenVK patterns), no flag is needed.
+    #[cfg(target_vendor = "apple")]
+    {
+        true
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        false
+    }
+}
+
 const VERTEX_SPIRV: &[u8] = include_bytes!("../../shaders/present.vert.spv");
 const FRAGMENT_SPIRV: &[u8] = include_bytes!("../../shaders/present.frag.spv");
 const STEREO_FRAGMENT_SPIRV: &[u8] = include_bytes!("../../shaders/present_stereo.frag.spv");
@@ -153,13 +168,36 @@ impl VulkanPresenter {
             .engine_name(c"Zakuro")
             .api_version(vk::API_VERSION_1_3);
 
-        let extensions = ash_window::enumerate_required_extensions(display.as_raw())
+        let mut extensions = ash_window::enumerate_required_extensions(display.as_raw())
             .map_err(vk_fail("querying surface extensions"))?
             .to_vec();
 
+        // the portability path: macOS only ships conformant drivers behind
+        // VK_KHR_portability_enumeration (MoltenVK, now KosmicKrisp), which a
+        // driver-less loader only enumerates for instances that ask for the
+        // extension and set the instance flag
+        let portability = 
+            // SAFETY: no layer names are passed; the loader stays loaded for this call
+            unsafe { entry.enumerate_instance_extension_properties(None) }
+            .map(|properties| {
+                properties.iter().any(|property|
+                    // SAFETY: ash fills `extension_name` as a NUL-terminated string
+                    unsafe { CStr::from_ptr(property.extension_name.as_ptr()) }
+                        .to_bytes() == ash::khr::portability_enumeration::NAME.to_bytes())
+            })
+            .unwrap_or(false)
+            || is_portability_system();
+        if portability {
+            extensions.push(ash::khr::portability_enumeration::NAME.as_ptr());
+        }
         let instance_info = vk::InstanceCreateInfo::default()
             .application_info(&application)
-            .enabled_extension_names(&extensions);
+            .enabled_extension_names(&extensions)
+            .flags(if portability {
+                vk::InstanceCreateFlags::ENUMERATE_PORTABILITY_KHR
+            } else {
+                vk::InstanceCreateFlags::empty()
+            });
         let instance = unsafe { entry.create_instance(&instance_info, None) }
             .map_err(vk_fail("creating the instance"))?;
 
