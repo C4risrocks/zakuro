@@ -98,6 +98,22 @@ impl Filter {
     }
 }
 
+/// the second window that shows one screen alone on another monitor,
+/// drawing straight from the same frames as the main one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompanionWindow {
+    /// one window, all the screens.
+    #[default]
+    Off,
+    /// the bottom screen, for the console's games that live on the touchy
+    /// one, on a monitor of its own.
+    BottomOnly,
+    /// the top screen alone instead, when a game is all about the upper
+    /// one.
+    TopOnly,
+}
+
 /// the top screen's shape. a game draws into 400x240 whatever this is, so
 /// anything but the console's own only looks right with a widescreen code
 /// on, which makes the game draw a wider scene into those pixels.
@@ -472,6 +488,13 @@ pub struct Settings {
     pub filter: Filter,
     /// scale the screens by whole numbers only, leaving a border.
     pub integer_scale: bool,
+    /// the second, one-screen window, off unless asked for.
+    #[serde(deserialize_with = "or_default")]
+    pub companion_window: CompanionWindow,
+    /// which monitor it goes to, the desktop's order by number, none for
+    /// the monitor after the main window's.
+    #[serde(deserialize_with = "or_default")]
+    pub companion_monitor: Option<usize>,
     /// how wide the top screen shows.
     #[serde(deserialize_with = "or_default")]
     pub top_shape: TopShape,
@@ -524,6 +547,8 @@ impl Default for Settings {
             layout: Screens::Stacked,
             filter: Filter::Smooth,
             integer_scale: false,
+            companion_window: CompanionWindow::Off,
+            companion_monitor: None,
             top_shape: TopShape::Console,
             stereo: Stereo3d::Off,
             depth_3d: 50,

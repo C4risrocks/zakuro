@@ -20,6 +20,12 @@ pub struct Options {
     /// the split-monitors spike: a second window draws the bottom screen
     /// alone, straight from the same frames.
     pub split_spike: bool,
+    /// a second window draws one screen alone, on another monitor when
+    /// there is one, this run only.
+    pub split: Option<bool>,
+    /// which monitor the second window goes to, the desktop's order by
+    /// number.
+    pub monitor_bottom: Option<usize>,
     /// a library of recompiled code for the title, or a directory of them.
     pub recompiled: Option<String>,
     /// draw on the host GPU rather than in software, the settings' choice
@@ -48,9 +54,11 @@ options:
                                    the host GPU through Vulkan, or software
                                    where that does not start)
   --scale <n>                      window scale factor (default: 2)
-  --split-spike                    a second, plain window draws only the
-                                   bottom screen, from the same frames (the
-                                   split-monitors spike, no settings yet)
+  --split <on|off>                 a second window draws one screen alone
+                                   (the bottom one), this run only
+  --monitor-bottom <n>             which monitor it goes to, the desktop's
+                                   order by number, 0 first
+  --split-spike                    --split on, the spike's older name
   (Esc opens the menu over a game, F1 pauses, F11 goes fullscreen)
   --headless <frames>              run without a window and print a report
   --new3ds                         emulate a New 3DS
@@ -84,6 +92,8 @@ pub fn parse() -> Result<Options, String> {
         new3ds: false,
         test_pattern: false,
         split_spike: false,
+        split: None,
+        monitor_bottom: None,
         recompiled: None,
         hardware_rasterizer: None,
         data: None,
@@ -136,6 +146,19 @@ pub fn parse() -> Result<Options, String> {
             "--profile" => options.profile = true,
             "--test-pattern" => options.test_pattern = true,
             "--split-spike" => options.split_spike = true,
+            "--split" => {
+                let value = args.next().ok_or("--split needs a value")?;
+                options.split = Some(match value.as_str() {
+                    "on" | "y" | "1" => true,
+                    "off" | "n" | "0" => false,
+                    other => return Err(format!("unknown split '{other}', use on or off")),
+                });
+            }
+            "--monitor-bottom" => {
+                let value = args.next().ok_or("--monitor-bottom needs a value")?;
+                options.monitor_bottom =
+                    Some(value.parse().map_err(|_| format!("'{value}' is not a monitor number"))?);
+            }
             other if other.starts_with('-') => {
                 return Err(format!("unknown option '{other}'"));
             }

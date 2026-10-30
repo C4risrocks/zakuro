@@ -555,7 +555,7 @@ impl ApplicationHandler for App {
                 // the game the command line names starts on the device the
                 // presenter may lend the renderer, once there is one
                 self.start();
-                if self.options.split_spike {
+                if self.companion_wanted() {
                     if let Err(error) = self.open_companion(event_loop) {
                         log::warn!("no companion window, {error}");
                     }
@@ -818,10 +818,17 @@ impl App {
     }
 
     /// the spike's second window: the bottom screen alone, placed on the
-    /// monitor after the main one's there is.
+    /// monitor after the main one's there is, or the one the run and the
+    /// settings name.
     fn open_companion(&mut self, event_loop: &ActiveEventLoop) -> Result<(), String> {
         let monitors = event_loop.available_monitors().collect::<Vec<_>>();
-        let after_main = monitors.get(1).or(monitors.last()).cloned();
+        let (wanted, wanted_monitor) = (
+            self.companion_kind(),
+            self.options.monitor_bottom.or(self.settings.companion_monitor),
+        );
+        let after_main = wanted_monitor
+            .and_then(|index| monitors.get(index).cloned())
+            .or_else(|| monitors.get(1).cloned().or_else(|| monitors.last().cloned()));
         // the bottom screen alone: a window of the bottom screen's pixels
         let (console_width, console_height) = self.layout.screens().size(self.top_shape.width());
         let (window_width, window_height) = (console_width * self.scale, console_height * self.scale);
@@ -839,7 +846,12 @@ impl App {
             Backend::create(event_loop, drafting, RendererKind::OpenGl)
         });
         let (window, mut backend) = created?;
-        backend.set_layout(settings::Screens::BottomOnly.screens());
+        // the one screen it draws, by what the run and the settings asked
+        backend.set_layout(match wanted {
+            settings::CompanionWindow::BottomOnly => settings::Screens::BottomOnly.screens(),
+            settings::CompanionWindow::TopOnly => settings::Screens::TopOnly.screens(),
+            settings::CompanionWindow::Off => return Ok(()),
+        });
         backend.set_top_width(self.settings.top_shape.width());
         backend.set_scaling(self.settings.filter.screens(), self.settings.integer_scale);
         backend.set_stereo(self.settings.stereo());
@@ -864,6 +876,26 @@ impl App {
         drop(self.companion_backend.take());
         self.companion = None;
         self.companion_id = None;
+    }
+
+    /// whether this run wants a second window, the command line's say
+    /// over the settings'.
+    fn companion_wanted(&self) -> bool {
+        self.options
+            .split
+            .unwrap_or(self.options.split_spike)
+            .then_some(true)
+            .unwrap_or_else(|| self.settings.companion_window != settings::CompanionWindow::Off)
+    }
+
+    /// which screen the second window shows, the spike keeping its bottom
+    /// one however the settings went.
+    fn companion_kind(&self) -> settings::CompanionWindow {
+        if self.options.split.is_some() || self.options.split_spike {
+            settings::CompanionWindow::BottomOnly
+        } else {
+            self.settings.companion_window
+        }
     }
 
     fn key(&mut self, event: KeyEvent, consumed: bool) {

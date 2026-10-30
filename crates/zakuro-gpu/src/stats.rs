@@ -40,10 +40,15 @@ mod tests {
 
     #[test]
     fn per_cent_of_shaded_draws() {
-        assert_eq!(geometry().2, None);
+        // the tiler's own tests run alongside, so the counts are not
+        // fresh: the test measures its own steps' deltas
+        let (gpu_was, cpu_was, _) = geometry();
         shaded_gpu();
-        assert_eq!(geometry(), (1, 0, Some(100)));
+        let (gpu, cpu, _) = geometry();
+        assert_eq!((gpu, cpu), (gpu_was + 1, cpu_was));
         shaded_cpu();
-        assert_eq!(geometry(), (1, 1, Some(50)));
+        let (gpu, cpu, per_cent) = geometry();
+        assert_eq!((gpu, cpu), (gpu_was + 1, cpu_was + 1));
+        assert_eq!(per_cent, Some(gpu * 100 / (gpu + cpu)));
     }
 }
