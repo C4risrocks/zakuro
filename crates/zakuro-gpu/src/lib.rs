@@ -16,6 +16,7 @@ pub mod registers;
 pub mod renderer;
 pub mod shader;
 pub mod state;
+pub mod stats;
 pub mod tev;
 pub mod texture;
 

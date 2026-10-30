@@ -311,6 +311,8 @@ fn run_headless(system: &mut System, frames: u64) {
         system.cpu.cycles as f64 / elapsed.as_secs_f64() / 1e6,
         system.status_line()
     );
+    let (shade_gpu, shade_cpu, per_cent) = zakuro_gpu::stats::geometry();
+    println!("draws gpu-shaded {shade_gpu}, cpu-shaded {shade_cpu} ({}% of them on the GPU)", per_cent.unwrap_or(0));
     if !system.fatal_errors.is_empty() {
         println!("fatal errors: {}", system.fatal_errors.join("; "));
     }
@@ -335,6 +337,14 @@ struct Running {
     frames: u32,
     counting_since: Instant,
     fps: f32,
+    /// the session's kpi facts: when the game began, frames emulated since
+    /// then, the slowest half-second window that ran frames (windows a
+    /// pause stretches do not vote), and the sound queue running dry all
+    /// told.
+    started: Instant,
+    total_frames: u64,
+    min_fps: f32,
+    underruns_total: u64,
 }
 
 impl Running {
@@ -349,14 +359,25 @@ impl Running {
             frames: 0,
             counting_since: Instant::now(),
             fps: 0.0,
+            started: Instant::now(),
+            total_frames: 0,
+            min_fps: 0.0,
+            underruns_total: 0,
         }
     }
 
     fn count_frame(&mut self) {
+        self.total_frames += 1;
         self.frames += 1;
         let elapsed = self.counting_since.elapsed();
         if elapsed >= Duration::from_millis(500) {
-            self.fps = self.frames as f32 / elapsed.as_secs_f32();
+            let pace = self.frames as f32 / elapsed.as_secs_f32();
+            self.fps = pace;
+            // a stretched window (the game paused mid one) keeps a fast
+            // pace from counting as the slowest
+            if elapsed < Duration::from_secs(2) && pace > 0.0 && (self.min_fps == 0.0 || pace < self.min_fps) {
+                self.min_fps = pace;
+            }
             self.frames = 0;
             self.counting_since = Instant::now();
         }
@@ -587,6 +608,29 @@ impl ApplicationHandler for App {
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
         if let Some(window) = &self.window {
             window.request_redraw();
+        }
+    }
+
+    /// the session's one kpi line, for the log file and thereby the docs'
+    /// table: frames run, their pace, the sound going dry and the draw
+    /// calls by who shaded them.
+    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        if let Some(game) = &self.game {
+            let seconds = game.started.elapsed().as_secs_f32().max(0.01);
+            let per_min = || game.underruns_total as f32 / (seconds / 60.0).max(0.001);
+            let (shade_gpu, shade_cpu, per_cent) = zakuro_gpu::stats::geometry();
+            log::info!(
+                "session kpi: {} frames emulated in {:.0}s, avg {:.1} fps, min {:.1} fps, sound ran dry {} ({:.2}/min), draws {}% gpu-shaded ({} gpu, {} cpu)",
+                game.total_frames,
+                seconds,
+                game.total_frames as f32 / seconds,
+                game.min_fps,
+                game.underruns_total,
+                per_min(),
+                per_cent.unwrap_or(0),
+                shade_gpu,
+                shade_cpu,
+            );
         }
     }
 }
@@ -1290,8 +1334,13 @@ impl App {
                 window.set_title(&title);
             }
             let underruns = self.audio.as_ref().map_or(0, |audio| audio.take_underruns());
-            if underruns > 0 && playing {
-                log::warn!("the sound ran dry {underruns} times, the emulation is falling behind");
+            if underruns > 0 {
+                if let Some(game) = &mut self.game {
+                    game.underruns_total += underruns as u64;
+                }
+                if playing {
+                    log::warn!("the sound ran dry {underruns} times, the emulation is falling behind");
+                }
             }
         }
 

@@ -3260,7 +3260,10 @@ fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Re
             let triangles = (indices.len() / 3) as u32;
             resources.triangles = assembled;
             match drawn {
-                Ok(()) => return Some(triangles),
+                Ok(()) => {
+                    crate::stats::shaded_gpu();
+                    return Some(triangles);
+                }
                 Err(error) => log::error!("the GPU could not shade, {error}, shading on the CPU"),
             }
         }
@@ -3283,6 +3286,9 @@ fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Re
         #[cfg(feature = "vulkan")]
         Vertices::Raw { .. } => return None,
     };
+    // whichever arm it was, its vertices shaded on the CPU: the scout's
+    // batches as well, and the raw ones the CPU decodes later count then
+    crate::stats::shaded_cpu();
     let (placed, indices) = (&placement.placed, &placement.indices);
     let (triangle_count, clipped_away, culled) = (placement.triangles, placement.clipped_away, placement.culled);
     let mut stats = FillStats::default();
@@ -3315,6 +3321,9 @@ fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Re
             // which of the vertices made each vertex of the draw is
             let at = |i: usize| order.map_or(i, |order| order[i]);
             let in_order: Vec<Vertex> = (0..order.map_or(shaded.len(), <[usize]>::len)).map(|i| shaded[at(i)]).collect();
+            // one cpu shading counted above hands over to the re-walk, so
+            // the draw counts once
+            crate::stats::shaded_cpu_hands_over();
             let drawn = rasterize(registers, memory, resources, Vertices::Shaded(&in_order));
             resources.hardware = hardware;
             return drawn;
