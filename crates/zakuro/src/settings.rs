@@ -114,6 +114,19 @@ pub enum CompanionWindow {
     TopOnly,
 }
 
+impl CompanionWindow {
+    pub const ALL: [CompanionWindow; 3] =
+        [CompanionWindow::Off, CompanionWindow::BottomOnly, CompanionWindow::TopOnly];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            CompanionWindow::Off => "Off, one window",
+            CompanionWindow::BottomOnly => "The bottom screen alone",
+            CompanionWindow::TopOnly => "The top screen alone",
+        }
+    }
+}
+
 /// the top screen's shape. a game draws into 400x240 whatever this is, so
 /// anything but the console's own only looks right with a widescreen code
 /// on, which makes the game draw a wider scene into those pixels.

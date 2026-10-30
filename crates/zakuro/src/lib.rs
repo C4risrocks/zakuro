@@ -118,6 +118,7 @@ pub fn run_with(linked: Option<Linked>, overlay: Option<Box<dyn GameOverlay>>) {
         companion_backend: None,
         companion: None,
         companion_id: None,
+        companion_serving: None,
         audio: None,
         mouse_down: false,
         tilting_from: None,
@@ -412,6 +413,9 @@ struct App {
     companion_backend: Option<Backend>,
     companion: Option<Window>,
     companion_id: Option<WindowId>,
+    /// what the window that is open serves with: the settings it was
+    /// opened by, to know when the settings' say changes it.
+    companion_serving: Option<(settings::CompanionWindow, Option<usize>)>,
     keyboard: Keyboard,
     gamepads: gamepad::Gamepads,
     audio: Option<audio::Audio>,
@@ -632,12 +636,21 @@ impl ApplicationHandler for App {
         }
     }
 
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         if let Some(window) = &self.window {
             window.request_redraw();
         }
         if let Some(window) = &self.companion {
             window.request_redraw();
+        }
+        // the desktop's monitors, listed while the settings are open for
+        // the second window's unsigned choice
+        if self.menus.settings_open && self.menus.monitors.is_empty() {
+            self.menus.monitors = event_loop
+                .available_monitors()
+                .enumerate()
+                .filter_map(|(index, monitor)| monitor.name().map(|name| (index, name)))
+                .collect();
         }
     }
 
@@ -866,6 +879,7 @@ impl App {
         self.companion_id = Some(window.id());
         self.companion = Some(window);
         self.companion_backend = Some(backend);
+        self.companion_serving = Some((wanted, self.settings.companion_monitor));
         Ok(())
     }
 
@@ -876,6 +890,35 @@ impl App {
         drop(self.companion_backend.take());
         self.companion = None;
         self.companion_id = None;
+        self.companion_serving = None;
+    }
+
+    /// the settings' say over the second window, applied live: opened,
+    /// moved to another monitor, or closed, from the menu's settings.
+    fn apply_companion(&mut self, event_loop: &ActiveEventLoop) {
+        let wanted = self.companion_kind();
+        let monitor = self.settings.companion_monitor;
+        let wanted_serving = if self.companion_run_only() { return; } else { Some((wanted, monitor)) };
+        if wanted_serving == self.companion_serving {
+            return;
+        }
+        match wanted {
+            settings::CompanionWindow::Off => self.close_companion(),
+            _ => {
+                // the kind and the monitor both change with one window's
+                // worth of work: close, then open it again
+                self.close_companion();
+                if let Err(error) = self.open_companion(event_loop) {
+                    log::warn!("no companion window, {error}");
+                }
+            }
+        }
+    }
+
+    /// whether the run's own flags, not the settings, say the second
+    /// window's state, which the menu then does not touch.
+    fn companion_run_only(&self) -> bool {
+        self.options.split.is_some() || self.options.split_spike
     }
 
     /// whether this run wants a second window, the command line's say
@@ -1349,7 +1392,10 @@ impl App {
                 }
             }
             Action::Quit => event_loop.exit(),
-            Action::Settings => self.apply_settings(),
+            Action::Settings => {
+                self.apply_settings();
+                self.apply_companion(event_loop);
+            }
             Action::Keyboard(text, button) => {
                 if let Some(game) = &mut self.game {
                     game.system.answer_keyboard(&text, button);

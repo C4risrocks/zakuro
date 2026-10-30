@@ -11,7 +11,7 @@ use zakuro_core::services::keyboard::Request;
 use crate::library::{Library, ICON_SIZE};
 use crate::recompile::{Job, Stage};
 use crate::gamepad::button_name;
-use crate::settings::{CameraSource, Filter, Keys, Language, PadButtons, Renderer, Screens, Settings, Stereo3d, TopShape};
+use crate::settings::{CameraSource, CompanionWindow, Filter, Keys, Language, PadButtons, Renderer, Screens, Settings, Stereo3d, TopShape};
 
 /// what the user asked for.
 #[derive(Debug, Clone, PartialEq)]
@@ -71,6 +71,9 @@ pub struct Menus {
     cheat_name: String,
     cheat_code: String,
     pub settings_open: bool,
+    /// the monitors the desktop has, refreshed while the settings stay
+    /// open, by number and name.
+    pub monitors: Vec<(usize, String)>,
     /// the binding waiting for a key, by its place in Keys::all_mut.
     pub rebinding: Option<usize>,
     /// the controller binding waiting for a button, by its place in
@@ -699,6 +702,26 @@ impl Menus {
                         ui.selectable_value(&mut settings.layout, layout, layout.name());
                     }
                 });
+                egui::ComboBox::from_label("Second window")
+                    .selected_text(settings.companion_window.name())
+                    .show_ui(ui, |ui| {
+                        for window in CompanionWindow::ALL {
+                            ui.selectable_value(&mut settings.companion_window, window, window.name());
+                        }
+                    })
+                    .response
+                    .on_hover_text("A plain window draws one screen alone, on the monitor named below, straight from the same frames it runs; the keyboard goes to the main one, the touch to whichever shows the bottom.");
+                egui::ComboBox::from_label("Second window's monitor")
+                    .selected_text(match settings.companion_monitor {
+                        Some(index) => self.monitors.iter().find(|(one, _)| *one == index).map_or(format!("Monitor {index}"), |(_, name)| name.clone()),
+                        None => "The monitor after the main window's".into(),
+                    })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut settings.companion_monitor, None, "The monitor after the main window's");
+                        for (index, name) in &self.monitors {
+                            ui.selectable_value(&mut settings.companion_monitor, Some(*index), name);
+                        }
+                    });
                 egui::ComboBox::from_label("Filter").selected_text(settings.filter.name()).show_ui(ui, |ui| {
                     for filter in Filter::ALL {
                         ui.selectable_value(&mut settings.filter, filter, filter.name());
