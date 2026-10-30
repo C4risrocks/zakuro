@@ -121,6 +121,8 @@ pub fn run_with(linked: Option<Linked>, overlay: Option<Box<dyn GameOverlay>>) {
         companion_serving: None,
         audio: None,
         mouse_down: false,
+        companion_cursor: None,
+        companion_mouse_down: false,
         tilting_from: None,
         cursor: (0.0, 0.0),
         last_title_update: Instant::now(),
@@ -431,6 +433,10 @@ struct App {
     /// the console while held.
     tilting_from: Option<(f32, f32)>,
     cursor: (f32, f32),
+    /// the pointer over the companion window, and whether its button is
+    /// down: they touch the screen the window shows.
+    companion_cursor: Option<(f32, f32)>,
+    companion_mouse_down: bool,
     last_title_update: Instant,
     /// when the next frame is due. frames run to a schedule rather than one
     /// after another, so that a slow one is made up by those after it and
@@ -581,6 +587,18 @@ impl ApplicationHandler for App {
                     if let Some(backend) = &mut self.companion_backend {
                         backend.resize(size.width, size.height);
                     }
+                }
+                WindowEvent::MouseInput { state, button, .. } => {
+                    if button == MouseButton::Left {
+                        // egui lives in the main window, so nothing here
+                        // can take the pointer off it
+                        self.companion_mouse_down = state == ElementState::Pressed && !self.pointer_taken(false);
+                        self.touch_companion();
+                    }
+                }
+                WindowEvent::CursorMoved { position, .. } => {
+                    self.companion_cursor = Some((position.x as f32, position.y as f32));
+                    self.touch_companion();
                 }
                 WindowEvent::CloseRequested => self.close_companion(),
                 _ => {}
@@ -891,6 +909,9 @@ impl App {
         self.companion = None;
         self.companion_id = None;
         self.companion_serving = None;
+        self.companion_cursor = None;
+        self.companion_mouse_down = false;
+        self.keyboard.touch(None);
     }
 
     /// the settings' say over the second window, applied live: opened,
@@ -1036,6 +1057,36 @@ impl App {
         let y = self.cursor.1 - bottom.y;
         let inside = x >= 0.0 && y >= 0.0 && x < bottom.width && y < bottom.height;
         self.keyboard.touch((self.mouse_down && inside).then(|| {
+            ((x / bottom.width * 320.0) as u16, (y / bottom.height * 240.0) as u16)
+        }));
+    }
+
+    /// the companion window's pointer touches the one screen it draws,
+    /// which only the bottom has touch over; the top alone touches
+    /// nothing. the same placing's math as the main window's, with the
+    /// window and the arrangement of its own.
+    fn touch_companion(&mut self) {
+        let Some(window) = &self.companion else { return };
+        let Some((cursor_x, cursor_y)) = self.companion_cursor else { return };
+        let screens = match self.companion_kind() {
+            settings::CompanionWindow::Off => return,
+            settings::CompanionWindow::TopOnly => {
+                // the top alone has never been the touch one
+                self.keyboard.touch(None);
+                return;
+            }
+            settings::CompanionWindow::BottomOnly => settings::Screens::BottomOnly,
+        };
+        let size = window.inner_size();
+        let (_, bottom) = layout(size.width, size.height, screens.screens(), self.top_shape.width(), self.settings.integer_scale);
+        let Some(bottom) = bottom else {
+            self.keyboard.touch(None);
+            return;
+        };
+        let x = cursor_x - bottom.x;
+        let y = cursor_y - bottom.y;
+        let inside = x >= 0.0 && y >= 0.0 && x < bottom.width && y < bottom.height;
+        self.keyboard.touch((self.companion_mouse_down && inside).then(|| {
             ((x / bottom.width * 320.0) as u16, (y / bottom.height * 240.0) as u16)
         }));
     }
