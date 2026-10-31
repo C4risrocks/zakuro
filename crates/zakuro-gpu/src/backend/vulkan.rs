@@ -45,7 +45,7 @@ const FRAMES_IN_FLIGHT: usize = 2;
 const WHOLE: [f32; 8] = [0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0, 1.0];
 
 /// what a screen is drawn from in a frame.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum Source {
     Nothing,
     /// the image of its own the presenter uploads pixels to.
@@ -126,7 +126,7 @@ pub struct VulkanPresenter {
     command_buffers: Vec<vk::CommandBuffer>,
     image_available: Vec<vk::Semaphore>,
     render_finished: Vec<vk::Semaphore>,
-    in_flight: Vec<vk::Fence>,
+    in_flight: Vec<Arc<crate::device::Submission>>,
     frame: usize,
 
     /// the top screen, the bottom one and the top one's picture for the
@@ -149,6 +149,22 @@ impl VulkanPresenter {
         window: &(impl HasDisplayHandle + HasWindowHandle),
         size: (u32, u32),
     ) -> Result<VulkanPresenter, PresentError> {
+        Self::create(window, size, None)
+    }
+
+    pub fn with_device(
+        window: &(impl HasDisplayHandle + HasWindowHandle),
+        size: (u32, u32),
+        device: Arc<SharedDevice>,
+    ) -> Result<Self, PresentError> {
+        Self::create(window, size, Some(device))
+    }
+
+    fn create(
+        window: &(impl HasDisplayHandle + HasWindowHandle),
+        size: (u32, u32),
+        existing: Option<Arc<SharedDevice>>,
+    ) -> Result<Self, PresentError> {
         // SAFETY: the loader reads the system's Vulkan library, which is the
         // documented way to start.
         let entry = unsafe { ash::Entry::load() }
@@ -204,8 +220,11 @@ impl VulkanPresenter {
             } else {
                 vk::InstanceCreateFlags::empty()
             });
-        let instance = unsafe { entry.create_instance(&instance_info, None) }
-            .map_err(vk_fail("creating the instance"))?;
+        let instance = match &existing {
+            Some(shared) => shared.instance.clone(),
+            None => unsafe { entry.create_instance(&instance_info, None) }
+                .map_err(vk_fail("creating the instance"))?,
+        };
 
         let surface_instance = ash::khr::surface::Instance::new(&entry, &instance);
         let surface = unsafe {
@@ -219,8 +238,18 @@ impl VulkanPresenter {
         }
         .map_err(vk_fail("creating the surface"))?;
 
-        let (physical_device, queue_family) =
-            pick_device(&instance, &surface_instance, surface)?;
+        let (physical_device, queue_family) = match &existing {
+            Some(shared) => {
+                let supported = unsafe { surface_instance.get_physical_device_surface_support(shared.physical, shared.family, surface) }
+                    .map_err(vk_fail("querying shared presentation support"))?;
+                if !supported {
+                    unsafe { surface_instance.destroy_surface(surface, None) };
+                    return Err(fail("shared queue cannot present to this surface"));
+                }
+                (shared.physical, shared.family)
+            }
+            None => pick_device(&instance, &surface_instance, surface)?,
+        };
 
         let properties = unsafe { instance.get_physical_device_properties(physical_device) };
         let name = unsafe { CStr::from_ptr(properties.device_name.as_ptr()) };
@@ -232,8 +261,12 @@ impl VulkanPresenter {
         // it draws are shown from its images rather than copied out and up
         // again, ZAKURO_COPY_SCREENS keeps the copies
         let copy = std::env::var_os("ZAKURO_COPY_SCREENS").is_some();
-        let swapchain_extension = [ash::khr::swapchain::NAME.as_ptr()];
-        let shared = if copy || !can_render(&instance, physical_device, queue_family) {
+        let swapchain_extension = crate::device::device_extensions(
+            &instance, physical_device, &[ash::khr::swapchain::NAME.as_ptr()],
+        ).map_err(vk_fail("querying device extensions"))?;
+        let shared = if existing.is_some() {
+            existing
+        } else if copy || !can_render(&instance, physical_device, queue_family) {
             None
         } else {
             render_device(&entry, &instance, physical_device, queue_family, &swapchain_extension)
@@ -352,7 +385,7 @@ impl VulkanPresenter {
         .map_err(vk_fail("allocating command buffers"))?;
 
         let mut image_available = Vec::with_capacity(FRAMES_IN_FLIGHT);
-        let mut render_finished = Vec::with_capacity(FRAMES_IN_FLIGHT);
+        let render_finished = Vec::new();
         let mut in_flight = Vec::with_capacity(FRAMES_IN_FLIGHT);
         for _ in 0..FRAMES_IN_FLIGHT {
             let semaphore_info = vk::SemaphoreCreateInfo::default();
@@ -360,20 +393,8 @@ impl VulkanPresenter {
                 unsafe { device.create_semaphore(&semaphore_info, None) }
                     .map_err(vk_fail("creating a semaphore"))?,
             );
-            render_finished.push(
-                unsafe { device.create_semaphore(&semaphore_info, None) }
-                    .map_err(vk_fail("creating a semaphore"))?,
-            );
-            in_flight.push(
-                unsafe {
-                    device.create_fence(
-                        // signalled, so the first frame does not wait forever.
-                        &vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED),
-                        None,
-                    )
-                }
-                .map_err(vk_fail("creating a fence"))?,
-            );
+            in_flight.push(Arc::new(crate::device::Submission::new(&device, shared.as_ref().cloned(), true)
+                .map_err(vk_fail("creating a fence"))?));
         }
 
         // the screens start at their native sizes, upload grows them if a
@@ -546,6 +567,9 @@ impl VulkanPresenter {
             .map_err(vk_fail("creating the swapchain"))?;
 
         self.destroy_swapchain_resources();
+        for semaphore in self.render_finished.drain(..) {
+            unsafe { self.device.destroy_semaphore(semaphore, None) };
+        }
         if old != vk::SwapchainKHR::null() {
             unsafe { self.swapchain_device.destroy_swapchain(old, None) };
         }
@@ -557,6 +581,8 @@ impl VulkanPresenter {
             .map_err(vk_fail("getting swapchain images"))?;
 
         for image in images {
+            self.render_finished.push(unsafe { self.device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None) }
+                .map_err(vk_fail("creating presentation semaphore"))?);
             let view = unsafe {
                 self.device.create_image_view(
                     &vk::ImageViewCreateInfo::default()
@@ -656,11 +682,18 @@ impl VulkanPresenter {
     /// what a screen is drawn from this frame, pixels uploaded to its own
     /// image or an image of the renderer's the frame's set points at.
     fn source(&mut self, index: usize, image: &ScreenImage<'_>) -> Result<Source, PresentError> {
-        if let Some(gpu) = image.gpu {
+        if let Some(gpu) = &image.gpu {
+            let Some(shared) = &self.shared else { return Err(fail("GPU image requires shared device")) };
+            if !Arc::ptr_eq(shared, &gpu.image.owner) {
+                return Err(fail("GPU image belongs to another device"));
+            }
+            if gpu.generation != gpu.image.generation.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(fail("GPU frame is no longer current"));
+            }
             self.screens[index].showing = false;
             let info = [vk::DescriptorImageInfo::default()
                 .sampler(self.sampler)
-                .image_view(gpu.view)
+                .image_view(gpu.image.view)
                 .image_layout(vk::ImageLayout::GENERAL)];
             let write = vk::WriteDescriptorSet::default()
                 .dst_set(self.gpu_sets[self.frame][index])
@@ -670,7 +703,7 @@ impl VulkanPresenter {
             // SAFETY: the frame's fence was waited on, so no command using
             // the set is in flight
             unsafe { self.device.update_descriptor_sets(&[write], &[]) };
-            return Ok(Source::Gpu(gpu));
+            return Ok(Source::Gpu(gpu.clone()));
         }
         if !image.is_empty() {
             self.upload(index, image)?;
@@ -683,8 +716,8 @@ impl VulkanPresenter {
     /// points the frame's 3D set at the top screen's two pictures, wherever
     /// each is drawn from.
     fn write_stereo_set(&self, sources: &[Source; 3]) {
-        let view = |index: usize| match sources[index] {
-            Source::Gpu(gpu) => Some((gpu.view, vk::ImageLayout::GENERAL)),
+        let view = |index: usize| match &sources[index] {
+            Source::Gpu(gpu) => Some((gpu.image.view, vk::ImageLayout::GENERAL)),
             Source::Own => Some((self.screens[index].view, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)),
             Source::Nothing => None,
         };
@@ -811,7 +844,7 @@ impl VulkanPresenter {
                 vk::SubpassContents::INLINE,
             );
             // each screen's set and place in its image
-            let crop = |index: usize| match sources[index] {
+            let crop = |index: usize| match &sources[index] {
                 Source::Nothing => None,
                 Source::Own => Some((self.screens[index].descriptor, WHOLE)),
                 Source::Gpu(gpu) => {
@@ -890,7 +923,7 @@ impl Presenter for VulkanPresenter {
         }
 
         let frame = self.frame;
-        let fence = self.in_flight[frame];
+        let fence = self.in_flight[frame].fence;
         unsafe {
             self.device
                 .wait_for_fences(&[fence], true, u64::MAX)
@@ -918,12 +951,11 @@ impl Presenter for VulkanPresenter {
             }
         };
 
-        // only reset the fence once we know we are going to submit.
-        unsafe {
-            self.device
-                .reset_fences(&[fence])
-                .map_err(vk_fail("resetting a fence"))?;
-        }
+        // Never reset a fence observed by a pooled image: each submission
+        // gets a distinct completion object, retained by both consumers.
+        let completion = Arc::new(crate::device::Submission::new(&self.device, self.shared.clone(), false)
+            .map_err(vk_fail("creating completion fence"))?);
+        let fence = completion.fence;
 
         for screen in &mut self.screens {
             screen.dirty = false;
@@ -957,7 +989,7 @@ impl Presenter for VulkanPresenter {
         }
 
         let wait = [self.image_available[frame]];
-        let signal = [self.render_finished[frame]];
+        let signal = [self.render_finished[image_index as usize]];
         let stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
         let buffers = [command_buffer];
         let submit = vk::SubmitInfo::default()
@@ -971,6 +1003,10 @@ impl Presenter for VulkanPresenter {
                 .map_err(vk_fail("submitting"))?;
         }
 
+        for image in [&top, &bottom, &right] {
+            if let Some(gpu) = &image.gpu { gpu.image.consumed_by(completion.clone()); }
+        }
+        self.in_flight[frame] = completion;
         let swapchains = [self.swapchain];
         let indices = [image_index];
         let present = vk::PresentInfoKHR::default()
@@ -1035,9 +1071,7 @@ impl Drop for VulkanPresenter {
             for semaphore in self.render_finished.drain(..) {
                 self.device.destroy_semaphore(semaphore, None);
             }
-            for fence in self.in_flight.drain(..) {
-                self.device.destroy_fence(fence, None);
-            }
+            self.in_flight.clear();
             if let Some(mut painter) = self.overlay.take() {
                 painter.destroy(&self.device);
             }

@@ -129,6 +129,9 @@ pub fn run_with(linked: Option<Linked>, overlay: Option<Box<dyn GameOverlay>>) {
         next_frame: Instant::now(),
         skipped: 0,
         shown: 0,
+        test_presented: 0,
+        test_started: None,
+        test_images: None,
         spent: Spent::default(),
         paused: false,
         fast_forward_key: false,
@@ -446,6 +449,9 @@ struct App {
     skipped: u32,
     /// frames shown since the title was last updated.
     shown: u32,
+    test_presented: u64,
+    test_started: Option<Instant>,
+    test_images: Option<[GpuScreen; 2]>,
     /// how long emulating and showing frames took since the title was last
     /// updated, for the frame rate's log.
     spent: Spent,
@@ -704,7 +710,7 @@ impl App {
         Config {
             new3ds: self.options.new3ds,
             data_dir: self.data_dir.clone(),
-            language: self.settings.language.code(),
+            language: self.options.language.unwrap_or(self.settings.language).code(),
             recompiled: self.options.recompiled.clone().filter(|_| !interpret).map(Into::into),
             linked: self.linked.filter(|_| !interpret),
             find_recompiled: !interpret,
@@ -872,7 +878,13 @@ impl App {
             attributes = attributes.with_position(winit::dpi::LogicalPosition::new(position.x + spot, position.y + 32));
         }
         let drafting = attributes.clone();
-        let created = Backend::create(event_loop, attributes, RendererKind::Vulkan).or_else(|error| {
+        let shared = self.backend.as_ref().and_then(Backend::shared_device);
+        let created = if self.options.test_pattern && std::env::var_os("ZAKURO_TEST_COMPANION_GL").is_some() {
+            Err("synthetic probe requests the OpenGL fallback".to_owned())
+        } else { match shared {
+            Some(device) => Backend::create_shared(event_loop, attributes, device),
+            None => Backend::create(event_loop, attributes, RendererKind::Vulkan),
+        }}.or_else(|error| {
             log::warn!("no Vulkan for the companion window, {error}");
             Backend::create(event_loop, drafting, RendererKind::OpenGl)
         });
@@ -945,11 +957,7 @@ impl App {
     /// whether this run wants a second window, the command line's say
     /// over the settings'.
     fn companion_wanted(&self) -> bool {
-        self.options
-            .split
-            .unwrap_or(self.options.split_spike)
-            .then_some(true)
-            .unwrap_or_else(|| self.settings.companion_window != settings::CompanionWindow::Off)
+        self.options.companion_wanted(self.settings.companion_window != settings::CompanionWindow::Off)
     }
 
     /// which screen the second window shows, the spike keeping its bottom
@@ -1870,7 +1878,7 @@ impl App {
         let blank = |screen: Screen| ((std::sync::Arc::new(Vec::new()), screen.width(), screen.height()), None);
         // the right eye's picture only while the 3D shows
         let stereo = self.settings.stereo != settings::Stereo3d::Off;
-        let (top, bottom, right) = match &mut self.game {
+        let (mut top, mut bottom, right) = match &mut self.game {
             Some(game) => (
                 shown(&mut game.system, Screen::Top),
                 shown(&mut game.system, Screen::Bottom),
@@ -1878,14 +1886,34 @@ impl App {
             ),
             None => (blank(Screen::Top), blank(Screen::Bottom), None),
         };
+        if self.options.test_pattern {
+            if self.test_images.is_none() {
+                if let Some(device) = self.backend.as_ref().and_then(Backend::shared_device) {
+                    let make = || Ok::<_, String>([
+                        device.solid_screen(top.0.1, top.0.2, [220.0 / 255.0, 40.0 / 255.0, 40.0 / 255.0, 1.0])?,
+                        device.solid_screen(bottom.0.1, bottom.0.2, [40.0 / 255.0, 90.0 / 255.0, 220.0 / 255.0, 1.0])?,
+                    ]);
+                    match make() {
+                        Ok(images) => self.test_images = Some(images),
+                        Err(error) => log::warn!("GPU synthetic pattern unavailable: {error}"),
+                    }
+                }
+            }
+            if let Some(images) = &self.test_images {
+                top.0.0 = std::sync::Arc::new(Vec::new());
+                bottom.0.0 = std::sync::Arc::new(Vec::new());
+                top.1 = Some(images[0].clone());
+                bottom.1 = Some(images[1].clone());
+            }
+        }
         let right = right.unwrap_or_else(|| blank(Screen::Top));
         let Some(backend) = &mut self.backend else { return };
         let (((top, top_width, top_height), top_gpu), ((bottom, bottom_width, bottom_height), bottom_gpu)) = (top, bottom);
         let ((right, right_width, right_height), right_gpu) = right;
         let result = backend.present(
-            ScreenImage { width: top_width, height: top_height, pixels: &top, gpu: top_gpu },
-            ScreenImage { width: bottom_width, height: bottom_height, pixels: &bottom, gpu: bottom_gpu },
-            ScreenImage { width: right_width, height: right_height, pixels: &right, gpu: right_gpu },
+            ScreenImage { width: top_width, height: top_height, pixels: &top, gpu: top_gpu.clone() },
+            ScreenImage { width: bottom_width, height: bottom_height, pixels: &bottom, gpu: bottom_gpu.clone() },
+            ScreenImage { width: right_width, height: right_height, pixels: &right, gpu: right_gpu.clone() },
             &overlay,
         );
         match result {
@@ -1895,15 +1923,32 @@ impl App {
                 event_loop.exit();
             }
         }
-        // the spike's window: the bottom screen alone, straight from the
-        // same frames the main window just drew. the GPU-referenced images
-        // are passed to one presenter only, so the companion's copies go
-        // up from the CPU's pixels.
+        // A shared presenter consumes the same GPU frame. A non-sharing
+        // fallback gets actual pixels, never an empty direct-image buffer.
+        let sharing = self.companion_backend.as_ref().and_then(Backend::shared_device)
+            .zip(self.backend.as_ref().and_then(Backend::shared_device))
+            .is_some_and(|(a, b)| std::sync::Arc::ptr_eq(&a, &b));
+        let fallback = if self.companion_backend.is_some() && !sharing {
+            let recover = |image: &Option<GpuScreen>| image.as_ref().map(|image| {
+                image.read_pixels().map(|(pixels, width, height)| (std::sync::Arc::new(pixels), width, height))
+            }).transpose();
+            match (recover(&top_gpu), recover(&bottom_gpu), recover(&right_gpu)) {
+                (Ok(top), Ok(bottom), Ok(right)) => Some((top, bottom, right)),
+                _ => {
+                    self.close_companion();
+                    log::warn!("the companion could not recover its exact GPU frame for the fallback");
+                    return;
+                }
+            }
+        } else { None };
         if let Some(backend) = self.companion_backend.as_mut() {
+            let top_copy = fallback.as_ref().and_then(|copies| copies.0.as_ref());
+            let bottom_copy = fallback.as_ref().and_then(|copies| copies.1.as_ref());
+            let right_copy = fallback.as_ref().and_then(|copies| copies.2.as_ref());
             let result = backend.present(
-                ScreenImage { width: top_width, height: top_height, pixels: &top, gpu: None },
-                ScreenImage { width: bottom_width, height: bottom_height, pixels: &bottom, gpu: None },
-                ScreenImage { width: right_width, height: right_height, pixels: &right, gpu: None },
+                ScreenImage { width: top_width, height: top_height, pixels: top_copy.map_or(top.as_slice(), |one| one.0.as_slice()), gpu: sharing.then_some(top_gpu).flatten() },
+                ScreenImage { width: bottom_width, height: bottom_height, pixels: bottom_copy.map_or(bottom.as_slice(), |one| one.0.as_slice()), gpu: sharing.then_some(bottom_gpu).flatten() },
+                ScreenImage { width: right_width, height: right_height, pixels: right_copy.map_or(right.as_slice(), |one| one.0.as_slice()), gpu: sharing.then_some(right_gpu).flatten() },
                 &overlay,
             );
             match result {
@@ -1914,6 +1959,25 @@ impl App {
                 }
             }
         }
+        if self.options.test_pattern {
+            let started = *self.test_started.get_or_insert_with(Instant::now);
+            self.test_presented += 1;
+            // Opt-in integration probe: exercise swapchain recreation and
+            // dropping one consumer while the main keeps showing GPU frames.
+            if std::env::var_os("ZAKURO_TEST_WINDOW_CYCLE").is_some() {
+                match self.test_presented {
+                    20 => if let Some(window) = &self.companion { let _ = window.request_inner_size(winit::dpi::LogicalSize::new(720, 540)); },
+                    40 => self.close_companion(),
+                    60 => if let Err(error) = self.open_companion(event_loop) { log::error!("test companion reopen: {error}"); event_loop.exit(); },
+                    _ => {}
+                }
+            }
+            if self.options.test_frames.is_some_and(|limit| self.test_presented >= limit) {
+                log::info!("presentation test complete: {} frames in {:.3}s ({:.1} fps), companion shared: {}, GPU images: {}", self.test_presented, started.elapsed().as_secs_f64(), (self.test_presented - 1) as f64 / started.elapsed().as_secs_f64(), sharing, self.test_images.is_some());
+                event_loop.exit();
+            }
+        }
+
     }
 }
 

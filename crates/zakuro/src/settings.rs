@@ -218,6 +218,11 @@ pub enum Language {
 }
 
 impl Language {
+    pub fn parse(code: &str) -> Option<Self> {
+        const CODES: [&str; 12] = ["ja", "en", "fr", "de", "it", "es", "zh-Hans", "ko", "nl", "pt", "ru", "zh-Hant"];
+        CODES.iter().position(|one| *one == code).map(|index| Self::ALL[index])
+    }
+
     pub const ALL: [Language; 12] = [
         Language::Japanese,
         Language::English,

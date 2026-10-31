@@ -1,6 +1,7 @@
 //! command line parsing.
 
 use zakuro_gpu::RendererKind;
+use crate::settings::Language;
 
 #[derive(Debug, Clone)]
 pub struct Options {
@@ -11,12 +12,15 @@ pub struct Options {
     /// window scale relative to the console's 400x480 combined screens, the
     /// settings' when not given.
     pub scale: Option<u32>,
+    /// runtime override; never written into player settings.
+    pub language: Option<Language>,
     /// run without a window for this many frames, then report.
     pub headless: Option<u64>,
     pub profile: bool,
     pub new3ds: bool,
     /// skip loading a ROM entirely and just paint both screens solid colors.
     pub test_pattern: bool,
+    pub test_frames: Option<u64>,
     /// the split-monitors spike: a second window draws the bottom screen
     /// alone, straight from the same frames.
     pub split_spike: bool,
@@ -53,6 +57,8 @@ options:
   --rasterizer <hardware|software> where the 3D is drawn (default: hardware,
                                    the host GPU through Vulkan, or software
                                    where that does not start)
+  --language <code>                system language for this run (ja,en,fr,de,it,es,
+                                   zh-Hans,ko,nl,pt,ru,zh-Hant)
   --scale <n>                      window scale factor (default: 2)
   --split <on|off>                 a second window draws one screen alone
                                    (the bottom one), this run only
@@ -60,6 +66,8 @@ options:
                                    order by number, 0 first
   --split-spike                    --split on, the spike's older name
   (Esc opens the menu over a game, F1 pauses, F11 goes fullscreen)
+  --test-pattern                   synthetic red/blue screens, no game data
+  --test-frames <n>                exit after n presentations (test-pattern only)
   --headless <frames>              run without a window and print a report
   --new3ds                         emulate a New 3DS
   --profile                        collect a sampling profile and print it
@@ -82,15 +90,21 @@ the working directory or where saves live, for titles that render text with it.
 ";
 
 pub fn parse() -> Result<Options, String> {
+    parse_args(std::env::args().skip(1))
+}
+
+pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Options, String> {
     let mut rom = None;
     let mut options = Options {
         rom: None,
         renderer: None,
         scale: None,
+        language: None,
         headless: None,
         profile: false,
         new3ds: false,
         test_pattern: false,
+        test_frames: None,
         split_spike: false,
         split: None,
         monitor_bottom: None,
@@ -101,7 +115,7 @@ pub fn parse() -> Result<Options, String> {
         mute: false,
     };
 
-    let mut args = std::env::args().skip(1);
+    let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "-h" | "--help" => {
@@ -113,6 +127,10 @@ pub fn parse() -> Result<Options, String> {
                 options.renderer = Some(
                     RendererKind::parse(&value).ok_or_else(|| format!("unknown renderer '{value}'"))?,
                 );
+            }
+            "--language" => {
+                let value = args.next().ok_or("--language needs a code")?;
+                options.language = Some(Language::parse(&value).ok_or_else(|| format!("unknown language '{value}'"))?);
             }
             "--scale" => {
                 let value = args.next().ok_or("--scale needs a value")?;
@@ -145,6 +163,12 @@ pub fn parse() -> Result<Options, String> {
             "--mute" => options.mute = true,
             "--profile" => options.profile = true,
             "--test-pattern" => options.test_pattern = true,
+            "--test-frames" => {
+                let value = args.next().ok_or("--test-frames needs a count")?;
+                let frames = value.parse().map_err(|_| "invalid test frame count")?;
+                if frames == 0 { return Err("--test-frames must be positive".into()); }
+                options.test_frames = Some(frames);
+            },
             "--split-spike" => options.split_spike = true,
             "--split" => {
                 let value = args.next().ok_or("--split needs a value")?;
@@ -167,9 +191,40 @@ pub fn parse() -> Result<Options, String> {
     }
 
     options.rom = rom;
+    if options.test_frames.is_some() && !options.test_pattern {
+        return Err("--test-frames requires --test-pattern".into());
+    }
     if options.headless.is_some() && options.rom.is_none() && !options.test_pattern {
         print!("{USAGE}");
         return Err("--headless needs a game".to_owned());
     }
     Ok(options)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn args(values: &[&str]) -> Result<Options, String> {
+        parse_args(values.iter().map(|value| value.to_string()))
+    }
+    #[test]
+    fn explicit_split_off_overrides_saved_companion() {
+        assert!(!args(&["--split", "off"]).unwrap().companion_wanted(true));
+        assert!(args(&[]).unwrap().companion_wanted(true));
+        assert!(!args(&[]).unwrap().companion_wanted(false));
+    }
+    #[test]
+    fn language_override_uses_console_codes_without_settings_writes() {
+        assert_eq!(args(&["--language", "es"]).unwrap().language.unwrap().code(), 5);
+        assert_eq!(args(&["--language", "zh-Hant"]).unwrap().language.unwrap().code(), 11);
+        assert!(args(&["--language", "bad"]).is_err());
+        assert!(args(&["--language"]).is_err());
+        assert!(args(&[]).unwrap().language.is_none());
+    }
+}
+
+impl Options {
+    pub fn companion_wanted(&self, saved: bool) -> bool {
+        self.split.unwrap_or(self.split_spike || saved)
+    }
 }

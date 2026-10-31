@@ -47,6 +47,19 @@ impl Backend {
         }
     }
 
+    /// A second surface on the renderer's existing device and queue.
+    pub fn create_shared(
+        event_loop: &ActiveEventLoop,
+        attributes: WindowAttributes,
+        shared: std::sync::Arc<SharedDevice>,
+    ) -> Result<(Window, Backend), String> {
+        let window = event_loop.create_window(attributes).map_err(|e| e.to_string())?;
+        let size = window.inner_size();
+        let presenter = VulkanPresenter::with_device(&window, (size.width.max(1), size.height.max(1)), shared)
+            .map_err(|e| e.to_string())?;
+        Ok((window, Backend::Vulkan(presenter)))
+    }
+
     pub fn name(&self) -> &'static str {
         match self {
             Backend::OpenGl { presenter, .. } => presenter.name(),
@@ -139,6 +152,7 @@ impl Backend {
                 context,
                 surface,
             } => {
+                context.make_current(surface).map_err(|e| PresentError::Backend(e.to_string()))?;
                 presenter.present(top, bottom, right, overlay)?;
                 surface
                     .swap_buffers(context)

@@ -25,10 +25,12 @@ impl ScreenImage<'_> {
 /// a screen's picture upright in an image of the renderer's, in the general
 /// layout, which the Vulkan presenter draws straight from when the two share
 /// a device.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct GpuScreen {
     #[cfg(feature = "vulkan")]
-    pub(crate) view: ash::vk::ImageView,
+    pub(crate) image: std::sync::Arc<crate::device::PresentationImage>,
+    #[cfg(feature = "vulkan")]
+    pub(crate) generation: u64,
     /// where the screen's pixels lie in the image, as texture coordinates,
     /// the corner and the size, then the corners inset by half a texel,
     /// which filtering keeps within.
@@ -472,5 +474,89 @@ mod tests {
         let (top, bottom) = layout(1680, 720, ScreenLayout::LargeTop, TOP_WIDTH, true);
         assert_eq!(top.unwrap().width, 1200.0);
         assert_eq!((bottom.unwrap().width, bottom.unwrap().height), (320.0, 240.0));
+    }
+}
+
+#[cfg(feature = "vulkan")]
+impl GpuScreen {
+    /// Recover this exact upright image/crop, including an interpolated twin.
+    /// Used only by a presenter which cannot consume the shared Vulkan image.
+    pub fn read_pixels(&self) -> Result<(Vec<u8>, u32, u32), String> {
+        use ash::vk;
+        let source = &self.image;
+        if self.generation != source.generation.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err("GPU frame is no longer current".into());
+        }
+        let [left, top, width, height] = self.area;
+        let x = (left * source.width as f32).round() as u32;
+        let y = (top * source.height as f32).round() as u32;
+        let width = (width * source.width as f32).round() as u32;
+        let height = (height * source.height as f32).round() as u32;
+        if width == 0 || height == 0 || x.checked_add(width).is_none_or(|end| end > source.width)
+            || y.checked_add(height).is_none_or(|end| end > source.height) {
+            return Err("GPU frame crop exceeds its image".into());
+        }
+        let bytes = u64::from(width) * u64::from(height) * 4;
+        let owner = source.owner.clone();
+        let device = &owner.device;
+        let map = |error: vk::Result| format!("GPU frame readback: {error:?}");
+        // All exceptional paths retire submitted work before releasing buffers.
+        struct Readback {
+            owner: std::sync::Arc<crate::SharedDevice>,
+            buffer: vk::Buffer,
+            memory: vk::DeviceMemory,
+            pool: vk::CommandPool,
+        }
+        impl Drop for Readback {
+            fn drop(&mut self) {
+                unsafe {
+                    let _ = self.owner.device.device_wait_idle();
+                    if self.pool != vk::CommandPool::null() { self.owner.device.destroy_command_pool(self.pool, None); }
+                    self.owner.device.destroy_buffer(self.buffer, None);
+                    if self.memory != vk::DeviceMemory::null() { self.owner.device.free_memory(self.memory, None); }
+                }
+            }
+        }
+        let buffer = unsafe { device.create_buffer(&vk::BufferCreateInfo::default().size(bytes)
+            .usage(vk::BufferUsageFlags::TRANSFER_DST).sharing_mode(vk::SharingMode::EXCLUSIVE), None) }.map_err(map)?;
+        let mut held = Readback { owner: owner.clone(), buffer, memory: vk::DeviceMemory::null(), pool: vk::CommandPool::null() };
+        let requirements = unsafe { device.get_buffer_memory_requirements(buffer) };
+        let properties = unsafe { owner.instance.get_physical_device_memory_properties(owner.physical) };
+        let pick = |flags| (0..properties.memory_type_count).find(|index|
+            requirements.memory_type_bits & (1 << index) != 0 && properties.memory_types[*index as usize].property_flags.contains(flags));
+        let index = pick(vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT)
+            .or_else(|| pick(vk::MemoryPropertyFlags::HOST_VISIBLE)).ok_or("no readable host memory for GPU frame")?;
+        let coherent = properties.memory_types[index as usize].property_flags.contains(vk::MemoryPropertyFlags::HOST_COHERENT);
+        held.memory = unsafe { device.allocate_memory(&vk::MemoryAllocateInfo::default().allocation_size(requirements.size).memory_type_index(index), None) }.map_err(map)?;
+        unsafe { device.bind_buffer_memory(buffer, held.memory, 0) }.map_err(map)?;
+        held.pool = unsafe { device.create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(owner.family), None) }.map_err(map)?;
+        let command = unsafe { device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(held.pool)
+            .level(vk::CommandBufferLevel::PRIMARY).command_buffer_count(1)) }.map_err(map)?[0];
+        let completion = crate::device::Submission::new(device, Some(owner.clone()), false).map_err(map)?;
+        unsafe {
+            device.begin_command_buffer(command, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)).map_err(map)?;
+            let ready = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::MEMORY_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_READ);
+            device.cmd_pipeline_barrier(command, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[ready], &[], &[]);
+            let region = vk::BufferImageCopy::default()
+                .image_subresource(vk::ImageSubresourceLayers::default().aspect_mask(vk::ImageAspectFlags::COLOR).layer_count(1))
+                .image_offset(vk::Offset3D { x: x as i32, y: y as i32, z: 0 })
+                .image_extent(vk::Extent3D { width, height, depth: 1 });
+            device.cmd_copy_image_to_buffer(command, source.image, vk::ImageLayout::GENERAL, buffer, &[region]);
+            let visible = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::HOST_READ);
+            device.cmd_pipeline_barrier(command, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::HOST, vk::DependencyFlags::empty(), &[visible], &[], &[]);
+            device.end_command_buffer(command).map_err(map)?;
+            device.queue_submit(owner.queue, &[vk::SubmitInfo::default().command_buffers(&[command])], completion.fence).map_err(map)?;
+        }
+        completion.wait().map_err(map)?;
+        let address = unsafe { device.map_memory(held.memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty()) }.map_err(map)?;
+        if !coherent {
+            if let Err(error) = unsafe { device.invalidate_mapped_memory_ranges(&[vk::MappedMemoryRange::default().memory(held.memory).size(vk::WHOLE_SIZE)]) } {
+                unsafe { device.unmap_memory(held.memory) };
+                return Err(map(error));
+            }
+        }
+        let pixels = unsafe { std::slice::from_raw_parts(address as *const u8, bytes as usize) }.to_vec();
+        unsafe { device.unmap_memory(held.memory) };
+        Ok((pixels, width, height))
     }
 }

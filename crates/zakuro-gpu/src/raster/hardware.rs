@@ -659,11 +659,12 @@ fn pixel_offset(tiled: bool, x: u32, y: u32, width: u32, bpp: u32) -> usize {
 }
 
 /// a screen's newest picture turned upright into an image that a presenter
-/// sharing the device draws straight from, and the batch that drew it. one
-/// is enough, every batch starts with a barrier that waits for the presents
-/// submitted before it, so no picture is drawn over while one shows it.
+/// sharing the device draws straight from, and the batch that drew it.
+/// Three output images allow both presenters to consume without a host wait;
+/// recycling waits only if all outputs still have outstanding consumers.
 struct Upright {
-    image: Image,
+    image: Arc<crate::device::PresentationImage>,
+    pool: crate::device::FramePool<crate::device::PresentationImage>,
     batch: u64,
     /// nothing changed the surface since.
     current: bool,
@@ -4582,20 +4583,30 @@ impl Hardware {
         self.mark(Work::Capture, false);
         // a row of the surface is a column of the screen
         let (width, height) = (self.surfaces[index].height * self.scale, self.surfaces[index].width * self.scale);
-        let made = match twin {
-            true => self.surfaces[index].twin_upright.is_some(),
-            false => self.surfaces[index].upright.is_some(),
+        let previous = match twin {
+            true => self.surfaces[index].twin_upright.as_mut(),
+            false => self.surfaces[index].upright.as_mut(),
         };
-        if !made {
-            let usage = vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::SAMPLED;
-            self.end_rendering();
-            let image = self.image(width, height, COLOR_FORMAT, usage, vk::ImageAspectFlags::COLOR)?;
-            let upright = Some(Upright { image, batch: 0, current: false });
-            match twin {
-                true => self.surfaces[index].twin_upright = upright,
-                false => self.surfaces[index].upright = upright,
-            }
+        let mut pool = previous.map(|upright| std::mem::take(&mut upright.pool)).unwrap_or_default();
+        let acquired = pool.acquire(
+            || {
+                let usage = vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_SRC;
+                self.end_rendering();
+                let raw = self.image(width, height, COLOR_FORMAT, usage, vk::ImageAspectFlags::COLOR)?;
+                Ok(crate::device::PresentationImage::new(raw.image, raw.view, raw.memory, width, height, self._shared.clone()))
+            },
+            |image| image.ready().map_err(vk_error("polling presentation consumers")),
+            |image| image.wait().map_err(vk_error("waiting for presentation consumers")),
+        );
+        let slot = match twin {
+            true => &mut self.surfaces[index].twin_upright,
+            false => &mut self.surfaces[index].upright,
+        };
+        if let Some(upright) = slot { upright.pool = pool; }
+        else {
+            *slot = Some(Upright { image: acquired.as_ref().map_err(Clone::clone)?.clone(), pool, batch: 0, current: false });
         }
+        slot.as_mut().unwrap().image = acquired?;
         let (layout, pipeline) = self.upright_image_pipeline()?;
         self.end_rendering();
         self.barrier();
@@ -4608,6 +4619,7 @@ impl Hardware {
         };
         let Some(upright) = upright else { unreachable!("made above") };
         upright.batch = batch;
+        upright.image.generation.store(batch, std::sync::atomic::Ordering::Relaxed);
         upright.current = true;
         let source = [vk::DescriptorImageInfo::default().image_view(from).image_layout(vk::ImageLayout::GENERAL)];
         let target = [vk::DescriptorImageInfo::default().image_view(upright.image.view).image_layout(vk::ImageLayout::GENERAL)];
@@ -4724,7 +4736,7 @@ impl Hardware {
         let Some(upright) = upright.filter(|upright| upright.batch == screen.batch) else {
             return Ok(None);
         };
-        let view = upright.image.view;
+        let image = upright.image.clone();
         if screen.batch >= self.batch {
             self.submit()?;
         }
@@ -4736,7 +4748,8 @@ impl Hardware {
         let (left, right) = ((first * scale) as f32, ((first + count) * scale) as f32);
         let (top, bottom) = (((row_pixels - screen.columns) * scale) as f32, (row_pixels * scale) as f32);
         Ok(Some(crate::GpuScreen {
-            view,
+            image,
+            generation: screen.batch,
             area: [left / width, top / height, (right - left) / width, (bottom - top) / height],
             bounds: [(left + 0.5) / width, (top + 0.5) / height, (right - 0.5) / width, (bottom - 0.5) / height],
         }))
@@ -5425,8 +5438,8 @@ impl Drop for Hardware {
             }
             for surface in &self.surfaces {
                 self.destroy_image(&surface.image);
-                let uprights = [&surface.upright, &surface.twin_upright].into_iter().flatten().map(|upright| &upright.image);
-                for image in [&surface.native, &surface.twin].into_iter().flatten().chain(uprights) {
+                // Upright images are Arc-owned and retire after their consumers.
+                for image in [&surface.native, &surface.twin].into_iter().flatten() {
                     self.destroy_image(image);
                 }
             }
@@ -5625,8 +5638,9 @@ pub(crate) fn render_device(
 ) -> Result<SharedDevice, String> {
     let priorities = [1.0];
     let queues = [vk::DeviceQueueCreateInfo::default().queue_family_index(family).queue_priorities(&priorities)];
-    let mut extensions = vec![ash::khr::push_descriptor::NAME.as_ptr()];
-    extensions.extend_from_slice(extra);
+    let mut extensions = crate::device::device_extensions(instance, physical, extra)
+        .map_err(vk_error("query device extensions"))?;
+    extensions.push(ash::khr::push_descriptor::NAME.as_ptr());
     // SAFETY: the physical device came from this instance
     let supported = unsafe { instance.get_physical_device_features(physical) };
     let logic_ops = supported.logic_op == vk::TRUE;
