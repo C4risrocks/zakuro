@@ -193,7 +193,18 @@ pub fn load(path: impl AsRef<std::path::Path>, mut config: Config) -> Result<Sys
                 }
                 system.recompiled = Some(library);
                 let text = exheader_text(&title);
-                system.hints = Some(crate::hints::Hints::new(&path, text));
+                // the hints belong beside the library the next recompile
+                // build reads. a copy deployed inside a bundle sits in a
+                // sealed parent that must not change under it, and its
+                // redirected home has no installed place, so a bundled
+                // library records nothing: the next build loses those
+                // addresses, everything else keeps them.
+                let bundled = path.parent().map_or(false, |parent| {
+                    parent.ancestors().any(|step| step.file_name().is_some_and(|one| one == "Contents"))
+                });
+                if !bundled {
+                    system.hints = Some(crate::hints::Hints::new(&path, text));
+                }
             }
             Err(error) => log::warn!("could not load {}, {error}, interpreting everything", path.display()),
         }
