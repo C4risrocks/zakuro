@@ -106,18 +106,43 @@ pub(crate) fn compile(source: &str) -> Result<Vec<u32>, String> {
 /// Metal, so the buffers get sequential indexes the spike wires by hand.
 #[cfg(feature = "msl-out")]
 pub(crate) fn compile_msl(source: &str) -> Result<String, String> {
+    compile_msl_stage(source, naga::ShaderStage::Vertex, &[])
+}
+
+/// any stage in GLSL to Metal's Shading Language, matching the Vulkan
+/// pipeline's compile of the same sources through spirv-out (M0.5 made the
+/// vertex one; M1.1 brings the rack). the defines carry the source-in-one
+/// variants the SPIR-V was built through (WRITES_DEPTH, TO_IMAGE).
+#[cfg(feature = "msl-out")]
+pub(crate) fn compile_msl_stage(
+    source: &str,
+    stage: naga::ShaderStage,
+    defines: &[(&str, &str)],
+) -> Result<String, String> {
     use naga::back::msl;
     use naga::front::glsl;
     use naga::valid::{Capabilities, ValidationFlags, Validator};
     let run = || -> Result<String, String> {
+        let label = match stage {
+            naga::ShaderStage::Vertex => "translated vertex shader",
+            naga::ShaderStage::Fragment => "translated fragment shader",
+            _ => "translated compute shader",
+        };
+        let mut options = glsl::Options::from(stage);
+        for (key, value) in defines {
+            options.defines.insert((*key).to_owned(), (*value).to_owned());
+        }
         let module = glsl::Frontend::default()
-            .parse(&glsl::Options::from(naga::ShaderStage::Vertex), source)
-            .map_err(|errors| errors.emit_to_string_with_path(source, "translated vertex shader"))?;
-        let info = Validator::new(ValidationFlags::all(), Capabilities::empty())
+            .parse(&options, source)
+            .map_err(|errors| errors.emit_to_string_with_path(source, label))?;
+        // the raster's tables unpack half-floats: that ask shows up only as
+        // the float16-in-float32 capability, which Metal itself holds
+        let capabilities = Capabilities::SHADER_FLOAT16_IN_FLOAT32;
+        let info = Validator::new(ValidationFlags::all(), capabilities)
             .validate(&module)
-            .map_err(|error| error.emit_to_string_with_path(source, "translated vertex shader"))?;
-        // the default options keep fake_missing_bindings on: the spike draws
-        // with dummies in the resource slots, the timing goal of M0.5
+            .map_err(|error| error.emit_to_string_with_path(source, label))?;
+        // the default options keep fake_missing_bindings on: the caller wires
+        // the resource slots the descriptors name, as the spike does
         let options = msl::Options::default();
         let pipeline = msl::PipelineOptions::default();
         let mut text = String::new();

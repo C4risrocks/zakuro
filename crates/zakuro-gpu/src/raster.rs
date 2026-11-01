@@ -11,6 +11,8 @@ use crate::lighting::{Lighting, Tables};
 
 #[cfg(feature = "vulkan")]
 pub(crate) mod hardware;
+#[cfg(all(feature = "metal", target_os = "macos"))]
+pub mod metal_hardware;
 use crate::texture::TextureFormat;
 use crate::shader::{self, ShaderUnit, Vec4};
 use crate::{format::ColorFormat, GpuMemory};
