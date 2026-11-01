@@ -709,10 +709,12 @@ impl Menus {
                     .selected_text(match settings.renderer {
                         Renderer::Vulkan => "Vulkan",
                         Renderer::OpenGl => "OpenGL",
+                        Renderer::Metal => "Metal (M2-raster pending)",
                     })
                     .show_ui(ui, |ui| {
                         ui.selectable_value(&mut settings.renderer, Renderer::Vulkan, "Vulkan");
                         ui.selectable_value(&mut settings.renderer, Renderer::OpenGl, "OpenGL");
+                        ui.selectable_value(&mut settings.renderer, Renderer::Metal, "Metal (spike)");
                     });
                 ui.checkbox(&mut settings.hardware_rasterizer, "Draw the 3D on the GPU");
                 ui.add_enabled(

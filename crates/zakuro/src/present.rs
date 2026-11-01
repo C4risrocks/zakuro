@@ -96,7 +96,7 @@ impl Backend {
             }
             Backend::Vulkan(presenter) => presenter.resize(width, height),
             #[cfg(all(feature = "metal", target_os = "macos"))]
-            Backend::Metal(presenter) => presenter.resize(width, height),
+            Backend::Metal(presenter) => presenter.resize(width, height, 1.0),
             Backend::None => {}
         }
     }
@@ -186,10 +186,12 @@ impl Backend {
             Backend::Vulkan(presenter) => presenter.present(top, bottom, right, overlay),
             #[cfg(all(feature = "metal", target_os = "macos"))]
             Backend::Metal(presenter) => {
-                // the M0 spike: one full-drawable triangle, hue walking with
-                // the frames; the screen content itself stays on the Vulkan
-                // and software paths until the raster lands (M1)
-                presenter.present_spike_frame(0.0);
+                // M1.0: the game's screens as Metal textures through the
+                // shared layout; the built-in test-pattern mode still drives
+                // the presentation-test counts
+                if let Err(error) = presenter.present_screens(top, bottom, right, zakuro_gpu::Stereo::default()) {
+                    return Err(PresentError::Backend(error));
+                }
                 Ok(())
             }
             Backend::None => Ok(()),

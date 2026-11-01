@@ -15,6 +15,7 @@ pub enum Renderer {
     #[default]
     Vulkan,
     OpenGl,
+    Metal,
 }
 
 /// how the screens are arranged in the window.

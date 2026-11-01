@@ -559,6 +559,7 @@ impl ApplicationHandler for App {
         let renderer = self.options.renderer.unwrap_or(match self.settings.renderer {
             Renderer::Vulkan => RendererKind::Vulkan,
             Renderer::OpenGl => RendererKind::OpenGl,
+            Renderer::Metal => RendererKind::Metal,
         });
 
         let backend = Backend::create(event_loop, attributes.clone(), renderer).or_else(|error| {
@@ -891,13 +892,19 @@ impl App {
         }
         let drafting = attributes.clone();
         let shared = self.backend.as_ref().and_then(Backend::shared_device);
+        // the companion runs whatever the main window's backend is: Metal
+        // companions own their textures, the Vulkan one shares the device
+        let companion_kind = match self.backend.as_ref() {
+            Some(Backend::Metal(_)) => RendererKind::Metal,
+            _ => RendererKind::Vulkan,
+        };
         let created = if self.options.test_pattern && std::env::var_os("ZAKURO_TEST_COMPANION_GL").is_some() {
             Err("synthetic probe requests the OpenGL fallback".to_owned())
         } else { match shared {
             Some(device) => Backend::create_shared(event_loop, attributes, device),
-            None => Backend::create(event_loop, attributes, RendererKind::Vulkan),
+            None => Backend::create(event_loop, attributes, companion_kind),
         }}.or_else(|error| {
-            log::warn!("no Vulkan for the companion window, {error}");
+            log::warn!("no companion for the main's renderer kind, {error}");
             Backend::create(event_loop, drafting, RendererKind::OpenGl)
         });
         let (window, mut backend) = created?;
