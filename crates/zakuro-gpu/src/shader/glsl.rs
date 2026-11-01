@@ -106,7 +106,8 @@ pub(crate) fn compile(source: &str) -> Result<Vec<u32>, String> {
 /// Metal, so the buffers get sequential indexes the spike wires by hand.
 #[cfg(feature = "msl-out")]
 pub(crate) fn compile_msl(source: &str) -> Result<String, String> {
-    compile_msl_stage(source, naga::ShaderStage::Vertex, &[])
+    let (text, entry) = compile_msl_stage_entry(source, naga::ShaderStage::Vertex, &[])?;
+    Ok(format!("// entry: {entry:?}\n{text}"))
 }
 
 /// any stage in GLSL to Metal's Shading Language, matching the Vulkan
@@ -114,15 +115,15 @@ pub(crate) fn compile_msl(source: &str) -> Result<String, String> {
 /// vertex one; M1.1 brings the rack). the defines carry the source-in-one
 /// variants the SPIR-V was built through (WRITES_DEPTH, TO_IMAGE).
 #[cfg(feature = "msl-out")]
-pub(crate) fn compile_msl_stage(
+pub(crate) fn compile_msl_stage_entry(
     source: &str,
     stage: naga::ShaderStage,
     defines: &[(&str, &str)],
-) -> Result<String, String> {
+) -> Result<(String, String), String> {
     use naga::back::msl;
     use naga::front::glsl;
     use naga::valid::{Capabilities, ValidationFlags, Validator};
-    let run = || -> Result<String, String> {
+    let run = || -> Result<(String, String), String> {
         let label = match stage {
             naga::ShaderStage::Vertex => "translated vertex shader",
             naga::ShaderStage::Fragment => "translated fragment shader",
@@ -143,15 +144,45 @@ pub(crate) fn compile_msl_stage(
             .map_err(|error| error.emit_to_string_with_path(source, label))?;
         // the default options keep fake_missing_bindings on: the caller wires
         // the resource slots the descriptors name, as the spike does
+        // the writer mangles the entry (`main` becomes `main0`…) and its
+        // returned value is the name the pipeline must bind the function by
         let options = msl::Options::default();
         let pipeline = msl::PipelineOptions::default();
         let mut text = String::new();
-        msl::Writer::new(&mut text)
-            .write(&module, &info, &options, &pipeline)
-            .map(|translation| format!("// entry: {translation:?}\n{text}"))
-            .map_err(|error| error.to_string())
+        let entry = naga_msl_entry(&mut text, &module, &info, &options, &pipeline)?;
+        Ok((text, entry))
     };
     std::panic::catch_unwind(run).unwrap_or_else(|_| Err("naga panicked".to_owned()))
+}
+
+#[cfg(feature = "msl-out")]
+fn naga_msl_entry(
+    text: &mut String,
+    module: &naga::Module,
+    info: &naga::valid::ModuleInfo,
+    options: &naga::back::msl::Options,
+    pipeline: &naga::back::msl::PipelineOptions,
+) -> Result<String, String> {
+    use naga::back::msl;
+    let translation = msl::Writer::new(text)
+        .write(module, info, options, pipeline)
+        .map_err(|error| error.to_string())?;
+    let name = translation
+        .entry_point_names
+        .first()
+        .and_then(|entry| entry.as_ref().ok())
+        .cloned()
+        .ok_or_else(|| String::from("the MSL entry point mangled itself away"))?;
+    Ok(name)
+}
+
+#[cfg(feature = "msl-out")]
+pub(crate) fn compile_msl_entry_point(
+    source: &str,
+    stage: naga::ShaderStage,
+    defines: &[(&str, &str)],
+) -> Result<(String, String), String> {
+    compile_msl_stage_entry(source, stage, defines)
 }
 
 /// instructions from one address up to the next place execution can come

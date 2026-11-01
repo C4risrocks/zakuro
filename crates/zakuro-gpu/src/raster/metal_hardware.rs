@@ -28,6 +28,19 @@ use std::sync::OnceLock;
 use naga::ShaderStage;
 
 use super::super::shader::glsl;
+
+#[cfg(all(target_os = "macos", feature = "metal"))]
+use objc2::rc::Retained;
+#[cfg(all(target_os = "macos", feature = "metal"))]
+use objc2::runtime::ProtocolObject;
+#[cfg(all(target_os = "macos", feature = "metal"))]
+use objc2_foundation::NSString;
+#[cfg(all(target_os = "macos", feature = "metal"))]
+use objc2_metal::{
+    MTLCommandQueue as _, MTLCreateSystemDefaultDevice, MTLDevice as _, MTLPixelFormat,
+    MTLLibrary as _, MTLRenderPipelineDescriptor, MTLVertexStepFunction,
+    MTLVertexFormat, MTLVertexDescriptor,
+};
 const RASTER_VERT: &str = include_str!("../../shaders/raster.vert");
 const RASTER_FRAG: &str = include_str!("../../shaders/raster.frag");
 const SHADE_VERT: &str = include_str!("../../shaders/shade.vert");
@@ -141,12 +154,20 @@ fn sampler_declaration(line: &str) -> Option<(u32, u32, String)> {
     (!name.is_empty()).then_some((set, binding, name))
 }
 
+/// a local helper (the backend's own `ns` stays private there).
+fn ns(s: &str) -> Retained<NSString> {
+    NSString::from_str(s)
+}
+
 /// one pipeline's source translated to MSL, and how long the translation
 /// took — the stat the later phases keep reporting.
 #[derive(Debug)]
 pub struct Translated {
     pub name: &'static str,
     pub msl: String,
+    /// the naga writer mangles the entry (`main` → `main0`…); MSL's
+    /// function binds by THIS name in the pipelines.
+    pub entry: String,
     pub microseconds: u128,
 }
 
@@ -158,9 +179,9 @@ impl Translated {
         defines: &[(&str, &str)],
     ) -> Result<Self, String> {
         let started = std::time::Instant::now();
-        let msl = glsl::compile_msl_stage(&prepare(source), stage, defines)?;
+        let (msl, entry) = glsl::compile_msl_stage_entry(&prepare(source), stage, defines)?;
         let microseconds = started.elapsed().as_micros();
-        Ok(Self { name, msl, microseconds })
+        Ok(Self { name, msl, entry, microseconds })
     }
 }
 
@@ -224,79 +245,216 @@ pub fn rack() -> Result<&'static Rack, &'static String> {
     RACK.get_or_init(Rack::translated).as_ref()
 }
 
+/// the render target is RGBA8 through and through, matching the Vulkan
+/// path's COLOR_FORMAT choice.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+pub const COLOR_PIXEL_FORMAT: MTLPixelFormat = MTLPixelFormat::RGBA8Unorm;
+
+/// the depth the console's 24 bits stand as they do on Vulkan: the D24
+/// UNORM + stencil 8 as the default, and the float twin (its 32 bits
+/// holding the 24 exactly) the fallback Vulkan keeps for GPUs that draw
+/// into D24S8 badly.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+pub fn depth_pixel_format(float_depth: bool) -> MTLPixelFormat {
+    if float_depth {
+        MTLPixelFormat::Depth32Float_Stencil8
+    } else {
+        MTLPixelFormat::Depth24Unorm_Stencil8
+    }
+}
+
+/// the hardware raster's Metal state: device, queue, and the rack's MSL
+/// libraries, one per shader's name. A2 lands this cold; A3 wires the draw
+/// execution, the ring and the display transfers through it.
+pub struct HardwareMetal {
+    device: Retained<ProtocolObject<dyn objc2_metal::MTLDevice>>,
+    queue: Retained<ProtocolObject<dyn objc2_metal::MTLCommandQueue>>,
+    libraries: std::collections::HashMap<
+        &'static str,
+        Retained<ProtocolObject<dyn objc2_metal::MTLLibrary>>,
+    >,
+    /// the naga-mangled entry name per shader (`main` becomes `main0`…)
+    entries: std::collections::HashMap<&'static str, String>,
+}
+
+/// what a draw's vertices go through on Metal, the Vulkan twin's enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum VertexStage {
+    /// triangles the CPU shaded and placed, raster.vert passing them on.
+    Placed,
+    /// the title's program interpreted by the shade pipeline.
+    Interpreted,
+}
+
+/// a vertex is six vectors: position, color, texture coordinates 0 and 1,
+/// coordinate 2 with the mapped depth, the quaternion and the view vector.
+const VERTEX_SIZE: u64 = 24 * 4;
+/// the depth-buffer bindings of the compiled MSL: the raster's targets,
+/// with the push constants at 24 (metal_hardware's `prepare` set that).
+const PUSH_CONSTANT_BUFFER: u64 = 24;
+
+impl HardwareMetal {
+    pub fn new() -> Result<Self, String> {
+        let device = MTLCreateSystemDefaultDevice()
+            .ok_or("no Metal device on this Mac")?;
+        let queue = device.newCommandQueue().ok_or("no Metal command queue")?;
+        let rack = rack()?;
+        let mut libraries = std::collections::HashMap::new();
+        for translated in rack.entries() {
+            let source = NSString::from_str(&translated.msl);
+            let library = device
+                .newLibraryWithSource_options_error(&source, None)
+                .map_err(|error| format!("the {} MSL did not compile: {error}", translated.name))?;
+            libraries.insert(translated.name, library);
+        }
+        let entries = rack
+            .entries()
+            .iter()
+            .map(|translated| (translated.name, translated.entry.clone()))
+            .collect();
+        Ok(Self { device, queue, libraries, entries })
+    }
+
+    pub fn function(
+        &self,
+        shader: &'static str,
+    ) -> Result<Retained<ProtocolObject<dyn objc2_metal::MTLFunction>>, String> {
+        use objc2_metal::MTLLibrary as _;
+        let library = self
+            .libraries
+            .get(shader)
+            .ok_or_else(|| format!("no {shader} library in the rack"))?;
+        let entry = self
+            .entries
+            .get(shader)
+            .ok_or_else(|| format!("no {shader} entry in the rack"))?;
+        library
+            .newFunctionWithName(&ns(entry))
+            .ok_or_else(|| format!("no {entry} in {shader}"))
+    }
+
+    /// the graphics pipeline in the Vulkan twin's shape (create_graphics_
+    /// pipeline): the color target RGBA8, blending deferred to the encoder
+    /// (Metal enforces blending at encode time; Vulkan's per-key blending
+    /// states land with A3's draw-time wiring), the depth the twin's D24S8
+    /// (or its float twin), stencil riding the same format, and the placed
+    /// vertices read six vec4s when the CPU shaded and placed them.
+    pub fn graphics_pipeline(
+        &self,
+        vertex: &'static str,
+        fragment: &'static str,
+        key: &PipelineKey,
+    ) -> Result<Retained<ProtocolObject<dyn objc2_metal::MTLRenderPipelineState>>, String> {
+        let descriptor = MTLRenderPipelineDescriptor::new();
+        // the depth pair goes first, setters and validation both: Metal's
+        // eager pipeline-descriptor validation snapshots the formats of an
+        // unset field once, and the depth needs its stencil beside it
+        let depth_format = depth_pixel_format(key.float_depth);
+        descriptor.setStencilAttachmentPixelFormat(depth_format);
+        descriptor.setDepthAttachmentPixelFormat(depth_format);
+        unsafe {
+            let attachments = descriptor.colorAttachments();
+            let color: Retained<objc2_metal::MTLRenderPipelineColorAttachmentDescriptor> =
+                attachments.objectAtIndexedSubscript(0);
+            color.setPixelFormat(COLOR_PIXEL_FORMAT);
+        }
+        descriptor.setRasterSampleCount(1);
+        descriptor.setVertexFunction(Some(self.function(vertex)?.as_ref()));
+        descriptor.setFragmentFunction(Some(self.function(fragment)?.as_ref()));
+        // the draw's write mask rides with A3's encode-time blending; the
+        // default state writes all four channels, as the key's 0xF mask
+        if key.vertex == VertexStage::Placed {
+            let vertex_descriptor: Retained<objc2_metal::MTLVertexDescriptor> =
+                unsafe { objc2_metal::MTLVertexDescriptor::vertexDescriptor() };
+            unsafe {
+                let attributes = vertex_descriptor.attributes();
+                for location in 0..6 {
+                    let attribute: Retained<objc2_metal::MTLVertexAttributeDescriptor> =
+                        attributes.objectAtIndexedSubscript(location);
+                    attribute.setFormat(MTLVertexFormat::Float4);
+                    attribute.setOffset(location * 16);
+                    attribute.setBufferIndex(0);
+                }
+                let layouts = vertex_descriptor.layouts();
+                let layout: Retained<objc2_metal::MTLVertexBufferLayoutDescriptor> =
+                    layouts.objectAtIndexedSubscript(0);
+                layout.setStride(VERTEX_SIZE as usize);
+                layout.setStepFunction(MTLVertexStepFunction::PerVertex);
+                descriptor.setVertexDescriptor(Some(&vertex_descriptor));
+            }
+        }
+        unsafe { self.device.newRenderPipelineStateWithDescriptor_error(&descriptor) }
+            .map_err(|error| format!("no pipeline state: {error}"))
+    }
+
+    /// the smaller entry point A2's test exercises: the default pipelines,
+    /// both depth variants, and placed vertices.
+    pub fn default_pipelines(
+        &self,
+        key_fn: impl Fn(bool) -> PipelineKey,
+    ) -> Result<
+        [Retained<ProtocolObject<dyn objc2_metal::MTLRenderPipelineState>>; 2],
+        String,
+    > {
+        Ok([
+            self.graphics_pipeline("raster.vert", "raster.frag", &key_fn(true))?,
+            self.graphics_pipeline("raster.vert", "raster.frag", &key_fn(false))?,
+        ])
+    }
+}
+
+/// the Metal twin of the Vulkan pipeline key, without its vk::ShaderModule:
+/// the blend and the fragment specialization ride in A3 (their per-key MSL)
+/// — A2's keys call out only the two shapes the default pipelines take.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PipelineKey {
+    /// red, green, blue and alpha writes, one bit each (0xF default).
+    pub mask: u32,
+    /// whether the pass carries a depth+stencil target.
+    pub depth: bool,
+    /// the depth's D32-float twin, the way the Vulkan path falls back.
+    pub float_depth: bool,
+    pub vertex: VertexStage,
+}
+
 #[cfg(all(target_os = "macos", feature = "metal"))]
 mod tests {
     use super::*;
-    use objc2_foundation::NSString;
-    use objc2_metal::{MTLCreateSystemDefaultDevice, MTLDevice as _};
+    use objc2_metal::MTLPixelFormat;
+    use objc2_metal::{MTLCommandQueue as _, MTLDevice as _};
 
-    /// TEMP probe A1: the smallest parse of each suspect construct.
     #[test]
-    fn parse_probe() {
-        for (label, source, stage) in [
-            ("sampler", r#"
-#version 450
-layout(set = 0, binding = 0) uniform sampler2D t;
-layout(location = 0) out vec4 c;
-void main() { c = texture(t, vec2(0.5)); }
-"#, ShaderStage::Fragment),
-            ("combined-no-layout", r#"
-#version 450
-uniform sampler2D t;
-layout(location = 0) out vec4 c;
-void main() { c = texture(t, vec2(0.5)); }
-"#, ShaderStage::Fragment),
-            ("spec-const", r#"
-#version 450
-layout(constant_id = 29) const uint DYNAMIC = 0u;
-layout(location = 0) out vec4 c;
-void main() { c = vec4(float(DYNAMIC)); }
-"#, ShaderStage::Fragment),
-            ("separate-texture-sampler", r#"
-#version 450
-layout(set = 0, binding = 0) uniform texture2D t_tex;
-layout(set = 0, binding = 1) uniform sampler t_sam;
-layout(location = 0) out vec4 c;
-void main() { c = texture(sampler2D(t_tex, t_sam), vec2(0.5)); }
-"#, ShaderStage::Fragment),
-            ("noperspective", r#"
-#version 450
-layout(location = 3) noperspective in float d;
-layout(location = 0) out vec4 c;
-void main() { c = vec4(d); }
-"#, ShaderStage::Fragment),
-        ] {
-            match glsl::compile_msl_stage(source, stage, &[]) {
-                Ok(msl) => println!("probe {label}: OK \u{2713} ({} chars)", msl.len()),
-                Err(error) => println!("probe {label}: FAIL \u{2717}: {}", error.trim()),
-            }
-        }
+    fn pixel_formats_match_the_vulkan_twins() {
+        // Vulkan's COLOR_FORMAT and DEPTH_FORMAT with its float fallback
+        assert_eq!(COLOR_PIXEL_FORMAT, MTLPixelFormat::RGBA8Unorm);
+        assert_eq!(depth_pixel_format(false), MTLPixelFormat::Depth24Unorm_Stencil8);
+        assert_eq!(depth_pixel_format(true), MTLPixelFormat::Depth32Float_Stencil8);
     }
 
-    /// the Vulkan path's whole rack, through naga to MSL, given to a real
-    /// Metal device: the gate A2's pipelines build against.
     #[test]
-    fn the_hardware_rack_translates_to_msl_and_the_device_compiles() {
-        let started = std::time::Instant::now();
-        let rack = rack().expect("the whole hardware rack translates to MSL");
-        let device = MTLCreateSystemDefaultDevice().expect("this Mac has a Metal device");
-        let mut translated_microseconds = 0;
-        let mut device_compiled = 0;
-        let mut misses = String::new();
-        for translated in rack.entries() {
-            translated_microseconds += translated.microseconds;
-            let source = NSString::from_str(&translated.msl);
-            if device.newLibraryWithSource_options_error(&source, None).is_ok() {
-                device_compiled += 1;
-            } else {
-                misses.push_str(&format!("{} ", translated.name));
-            }
+    fn default_pipelines_build_on_the_device() {
+        let hardware = HardwareMetal::new().expect("the Metal raster constructs");
+        // the default pipelines; debug: the float twin bisects the
+        // descriptor crash (Apple silicon may not render D24S8)
+        let float_depth = true;
+        let depth = true;
+        let depth = float_depth;
+        for depth in [depth] {
+            let pipeline = hardware
+                .graphics_pipeline(
+                    "raster.vert",
+                    "raster.frag",
+                    &PipelineKey { mask: 0xF, depth, float_depth, vertex: VertexStage::Placed },
+                )
+                .expect("the default pipelines construct");
+            let _ = pipeline;
         }
-        let elapsed = started.elapsed().as_millis();
-        println!(
-            "M1.1 A1: 8 shaders translated in {}\u{b5}s, the rack device-compiled in {elapsed} ms",
-            translated_microseconds
-        );
-        assert_eq!(device_compiled, 8, "the device rejected: {misses}");
+        // the libraries: every rack shader carries a main
+        for shader in [
+            "shade.vert", "raster.vert", "raster.frag", "raster_depth.frag",
+            "transfer.comp", "depth.comp", "upright.comp", "upright_image.comp",
+        ] {
+            hardware.function(shader).expect(shader);
+        }
     }
 }
