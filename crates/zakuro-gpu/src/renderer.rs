@@ -15,6 +15,7 @@ pub enum RendererKind {
     Software,
     OpenGl,
     Vulkan,
+    Metal,
 }
 
 impl RendererKind {
@@ -23,6 +24,7 @@ impl RendererKind {
             "software" | "none" | "null" => Some(RendererKind::Software),
             "opengl" | "gl" => Some(RendererKind::OpenGl),
             "vulkan" | "vk" => Some(RendererKind::Vulkan),
+            "metal" => Some(RendererKind::Metal),
             _ => None,
         }
     }

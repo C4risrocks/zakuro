@@ -2,6 +2,8 @@
 
 #[cfg(feature = "opengl")]
 pub mod gl;
+#[cfg(all(feature = "metal", target_os = "macos"))]
+pub mod metal;
 #[cfg(feature = "vulkan")]
 pub mod vulkan;
 #[cfg(feature = "vulkan")]

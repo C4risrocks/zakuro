@@ -24,6 +24,8 @@ pub enum Backend {
         surface: Surface<WindowSurface>,
     },
     Vulkan(VulkanPresenter),
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    Metal(zakuro_gpu::backend::metal::MetalPresenter),
     /// no window output, used when a backend could not start but the emulator
     /// should still run.
     None,
@@ -38,6 +40,13 @@ impl Backend {
         match kind {
             RendererKind::OpenGl => create_opengl(event_loop, attributes),
             RendererKind::Vulkan => create_vulkan(event_loop, attributes),
+            #[cfg(all(feature = "metal", target_os = "macos"))]
+            RendererKind::Metal => create_metal(event_loop, attributes),
+            #[cfg(not(all(feature = "metal", target_os = "macos")))]
+            RendererKind::Metal => {
+                let _ = attributes;
+                Err("the metal backend is not compiled in; build with --features metal".to_owned())
+            }
             RendererKind::Software => {
                 let window = event_loop
                     .create_window(attributes)
@@ -64,6 +73,8 @@ impl Backend {
         match self {
             Backend::OpenGl { presenter, .. } => presenter.name(),
             Backend::Vulkan(presenter) => presenter.name(),
+            #[cfg(all(feature = "metal", target_os = "macos"))]
+            Backend::Metal(presenter) => presenter.name(),
             Backend::None => "none",
         }
     }
@@ -84,16 +95,20 @@ impl Backend {
                 );
             }
             Backend::Vulkan(presenter) => presenter.resize(width, height),
+            #[cfg(all(feature = "metal", target_os = "macos"))]
+            Backend::Metal(presenter) => presenter.resize(width, height),
             Backend::None => {}
         }
     }
 
     /// whether showing a frame waits for the display, the OpenGL swap waits
-    /// for the vertical blank.
+    /// for the vertical blank. Metal's drawables pace the same way.
     pub fn waits_for_display(&self) -> bool {
         match self {
             Backend::OpenGl { .. } => true,
             Backend::Vulkan(presenter) => presenter.waits_for_display(),
+            #[cfg(all(feature = "metal", target_os = "macos"))]
+            Backend::Metal(_) => true,
             Backend::None => false,
         }
     }
@@ -103,6 +118,8 @@ impl Backend {
     pub fn shared_device(&self) -> Option<std::sync::Arc<SharedDevice>> {
         match self {
             Backend::Vulkan(presenter) => presenter.shared_device(),
+            #[cfg(all(feature = "metal", target_os = "macos"))]
+            Backend::Metal(_) => None,
             _ => None,
         }
     }
@@ -111,6 +128,8 @@ impl Backend {
         match self {
             Backend::OpenGl { presenter, .. } => presenter.set_scaling(filter, integer),
             Backend::Vulkan(presenter) => presenter.set_scaling(filter, integer),
+            #[cfg(all(feature = "metal", target_os = "macos"))]
+            Backend::Metal(_) => {}
             Backend::None => {}
         }
     }
@@ -119,22 +138,28 @@ impl Backend {
         match self {
             Backend::OpenGl { presenter, .. } => presenter.set_stereo(stereo),
             Backend::Vulkan(presenter) => presenter.set_stereo(stereo),
+            #[cfg(all(feature = "metal", target_os = "macos"))]
+            Backend::Metal(_) => {}
             Backend::None => {}
         }
     }
 
     pub fn set_layout(&mut self, arrangement: ScreenLayout) {
-        match self {
+            match self {
             Backend::OpenGl { presenter, .. } => presenter.set_layout(arrangement),
             Backend::Vulkan(presenter) => presenter.set_layout(arrangement),
+            #[cfg(all(feature = "metal", target_os = "macos"))]
+            Backend::Metal(_) => {}
             Backend::None => {}
         }
     }
 
     pub fn set_top_width(&mut self, width: f32) {
-        match self {
+            match self {
             Backend::OpenGl { presenter, .. } => presenter.set_top_width(width),
             Backend::Vulkan(presenter) => presenter.set_top_width(width),
+            #[cfg(all(feature = "metal", target_os = "macos"))]
+            Backend::Metal(_) => {}
             Backend::None => {}
         }
     }
@@ -159,6 +184,14 @@ impl Backend {
                     .map_err(|e| PresentError::Backend(e.to_string()))
             }
             Backend::Vulkan(presenter) => presenter.present(top, bottom, right, overlay),
+            #[cfg(all(feature = "metal", target_os = "macos"))]
+            Backend::Metal(presenter) => {
+                // the M0 spike: one full-drawable triangle, hue walking with
+                // the frames; the screen content itself stays on the Vulkan
+                // and software paths until the raster lands (M1)
+                presenter.present_spike_frame(0.0);
+                Ok(())
+            }
             Backend::None => Ok(()),
         }
     }
@@ -249,4 +282,32 @@ fn create_vulkan(
     let presenter = VulkanPresenter::new(&window, (size.width.max(1), size.height.max(1)))
         .map_err(|e| e.to_string())?;
     Ok((window, Backend::Vulkan(presenter)))
+}
+
+#[cfg(all(feature = "metal", target_os = "macos"))]
+fn create_metal(
+    event_loop: &ActiveEventLoop,
+    attributes: WindowAttributes,
+) -> Result<(Window, Backend), String> {
+    use raw_window_handle::HasWindowHandle as _;
+    let window = event_loop
+        .create_window(attributes)
+        .map_err(|e| e.to_string())?;
+    let size = window.inner_size();
+    let scale = window.scale_factor();
+    // the spike presenter hangs a CAMetalLayer on the window's NSView
+    let raw = window.window_handle().map_err(|e| e.to_string())?.as_raw();
+    let ns_view = match raw {
+        raw_window_handle::RawWindowHandle::AppKit(handle) => {
+            handle.ns_view.as_ptr() as *mut core::ffi::c_void
+        }
+        _ => return Err("the window is not an AppKit window".to_owned()),
+    };
+    let presenter = zakuro_gpu::backend::metal::MetalPresenter::new(
+        ns_view,
+        size.width.max(1),
+        size.height.max(1),
+        scale,
+    )?;
+    Ok((window, Backend::Metal(presenter)))
 }

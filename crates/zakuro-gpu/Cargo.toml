@@ -8,6 +8,7 @@ license.workspace = true
 default = ["jit"]
 opengl = ["dep:glow"]
 vulkan = ["dep:ash", "dep:ash-window", "dep:naga"]
+metal = ["dep:objc2", "dep:objc2-foundation", "dep:objc2-metal", "dep:objc2-quartz-core", "dep:objc2-core-graphics", "dep:objc2-core-foundation", "dep:objc2-app-kit"]
 # the shaders the CPU runs compiled to the host's code instead of interpreted
 jit = ["dep:cranelift-codegen", "dep:cranelift-frontend", "dep:cranelift-jit", "dep:cranelift-module", "dep:cranelift-native"]
 
@@ -37,3 +38,16 @@ cranelift-frontend = { version = "0.135", optional = true }
 cranelift-jit = { version = "0.135", optional = true }
 cranelift-module = { version = "0.135", optional = true }
 cranelift-native = { version = "0.135", optional = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = { version = "0.6", optional = true }
+objc2-foundation = { version = "0.3", optional = true }
+objc2-metal = { version = "0.3", optional = true, features = [
+    "MTLDevice", "MTLCommandQueue", "MTLCommandBuffer", "MTLCommandEncoder",
+    "MTLRenderPass", "MTLRenderCommandEncoder", "MTLRenderPipeline",
+    "MTLLibrary", "MTLDrawable", "MTLPixelFormat", "MTLTypes",
+] }
+objc2-quartz-core = { version = "0.3", optional = true, features = ["CAMetalLayer"] }
+objc2-core-graphics = { version = "0.3", optional = true, features = ["CGBase"] }
+objc2-app-kit = { version = "0.3", optional = true, features = ["NSResponder", "NSView"] }
+objc2-core-foundation = { version = "0.3", optional = true }

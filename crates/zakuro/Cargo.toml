@@ -12,6 +12,9 @@ path = "src/lib.rs"
 name = "zakuro"
 path = "src/main.rs"
 
+[features]
+metal = ["zakuro-gpu/metal"]
+
 [dependencies]
 zakuro-common.workspace = true
 zakuro-core.workspace = true
