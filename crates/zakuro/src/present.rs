@@ -129,7 +129,7 @@ impl Backend {
             Backend::OpenGl { presenter, .. } => presenter.set_scaling(filter, integer),
             Backend::Vulkan(presenter) => presenter.set_scaling(filter, integer),
             #[cfg(all(feature = "metal", target_os = "macos"))]
-            Backend::Metal(_) => {}
+            Backend::Metal(presenter) => presenter.set_scaling(filter, integer),
             Backend::None => {}
         }
     }
@@ -139,7 +139,7 @@ impl Backend {
             Backend::OpenGl { presenter, .. } => presenter.set_stereo(stereo),
             Backend::Vulkan(presenter) => presenter.set_stereo(stereo),
             #[cfg(all(feature = "metal", target_os = "macos"))]
-            Backend::Metal(_) => {}
+            Backend::Metal(presenter) => presenter.set_stereo(stereo),
             Backend::None => {}
         }
     }
@@ -149,7 +149,7 @@ impl Backend {
             Backend::OpenGl { presenter, .. } => presenter.set_layout(arrangement),
             Backend::Vulkan(presenter) => presenter.set_layout(arrangement),
             #[cfg(all(feature = "metal", target_os = "macos"))]
-            Backend::Metal(_) => {}
+            Backend::Metal(presenter) => presenter.set_layout(arrangement),
             Backend::None => {}
         }
     }
@@ -159,7 +159,7 @@ impl Backend {
             Backend::OpenGl { presenter, .. } => presenter.set_top_width(width),
             Backend::Vulkan(presenter) => presenter.set_top_width(width),
             #[cfg(all(feature = "metal", target_os = "macos"))]
-            Backend::Metal(_) => {}
+            Backend::Metal(presenter) => presenter.set_top_width(width),
             Backend::None => {}
         }
     }

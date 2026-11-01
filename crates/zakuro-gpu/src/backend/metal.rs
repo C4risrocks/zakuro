@@ -16,25 +16,36 @@ use objc2_core_foundation::CGSize;
 use objc2_foundation::NSString;
 use objc2_metal::{
     MTLClearColor, MTLLoadAction, MTLPixelFormat, MTLRenderPassDescriptor,
-    MTLRenderPipelineDescriptor, MTLResourceOptions, MTLStoreAction,
-    MTLTextureDescriptor, MTLCreateSystemDefaultDevice,
-    MTLSamplerState, MTLDevice as _, MTLLibrary as _, MTLCommandQueue as _,
-    MTLCommandBuffer as _, MTLRenderCommandEncoder as _, MTLRenderPipelineDescriptor as _,
+    MTLRenderPipelineDescriptor, MTLStoreAction, MTLTextureDescriptor,
+    MTLCreateSystemDefaultDevice, MTLDevice as _, MTLLibrary as _,
+    MTLCommandQueue as _, MTLCommandBuffer as _, MTLRenderCommandEncoder as _,
 };
 use objc2_quartz_core::{CAMetalDrawable as _, CAMetalLayer};
 use super::{place, ScreenImage, ScreenLayout, Stereo};
 use super::ScreenFilter;
 
-use crate::backend::{Viewport, Shown};
+use crate::backend::Shown;
 
 const SHADER: &str = r"#include <metal_stdlib>
 using namespace metal;
+struct ScreenRect { float4 rect; }; // x0, y0, x1, y1 in clip space
 struct SVIn {
     float4 position [[position]];
     float2 uv [[user(locn0)]];
 };
-vertex SVIn screen_vertex(const device SVIn* verts [[buffer(0)]], uint vid [[vertex_id]]) {
-    return verts[vid];
+vertex SVIn screen_vertex(const device ScreenRect& quad [[buffer(0)]], uint vid [[vertex_id]]) {
+    // the six corners walk two triangles over the rect: (LT RT BR)(BR LB LT);
+    // the texture's first row is the screen's top, so v = 0 at the top edge
+    SVIn out;
+    switch (vid) {
+        case 0: out.position = float4(quad.rect.x, quad.rect.w, 0.0, 1.0); out.uv = float2(0.0, 0.0); break;
+        case 1: out.position = float4(quad.rect.z, quad.rect.w, 0.0, 1.0); out.uv = float2(1.0, 0.0); break;
+        case 2: out.position = float4(quad.rect.z, quad.rect.y, 0.0, 1.0); out.uv = float2(1.0, 1.0); break;
+        case 3: out.position = float4(quad.rect.z, quad.rect.y, 0.0, 1.0); out.uv = float2(1.0, 1.0); break;
+        case 4: out.position = float4(quad.rect.x, quad.rect.y, 0.0, 1.0); out.uv = float2(0.0, 1.0); break;
+        default: out.position = float4(quad.rect.x, quad.rect.w, 0.0, 1.0); out.uv = float2(0.0, 0.0); break;
+    }
+    return out;
 }
 fragment half4 screen_fragment(texture2d<float> tex [[texture(0)]], sampler samp [[sampler(0)]], SVIn in [[stage_in]]) {
     return half4(tex.sample(samp, in.uv));
@@ -87,30 +98,6 @@ fn index_of(shown: Shown) -> usize {
     }
 }
 
-/// the quad's corners in drawable pixels, with uv, two triangles.
-fn quad_bytes(viewport: &Viewport, height: u32, top: bool) -> [f32; 36] {
-    let (x0, x1) = (viewport.x, viewport.x + viewport.width);
-    let y0 = viewport.y;
-    let y1 = viewport.y + viewport.height;
-    let _ = (height as f32 - y1, top);
-    // drawable pixels: rows grow downward from the layer's top
-    let corners: [(f32, f32); 4] = [(x0, y0), (x1, y0), (x1, y1), (x0, y1)];
-    let uv: [(f32, f32); 4] = if top { [(0.0, 1.0), (1.0, 1.0), (1.0, 0.0), (0.0, 0.0)] } else { [(0.0, 1.0), (1.0, 1.0), (1.0, 0.0), (0.0, 0.0)] };
-    let mut out = [0.0f32; 36];
-    let indices = [0usize, 1, 2, 2, 3, 0];
-    // each vertex is stride 6: position x/y/z/w then uv u/v
-    for (i, index) in indices.iter().enumerate() {
-        let at = i * 6;
-        out[at] = corners[*index].0;
-        out[at + 1] = corners[*index].1;
-        out[at + 2] = 0.0;
-        out[at + 3] = 1.0;
-        out[at + 4] = uv[*index].0;
-        out[at + 5] = uv[*index].1;
-    }
-    out
-}
-
 impl MetalPresenter {
     pub fn new(ns_view: *mut core::ffi::c_void, width: u32, height: u32, scale: f64) -> Result<Self, String> {
         let device = MTLCreateSystemDefaultDevice().ok_or("no Metal device on this Mac")?;
@@ -140,6 +127,9 @@ impl MetalPresenter {
         layer.setDevice(Some(&*device));
         layer.setPixelFormat(MTLPixelFormat::BGRA8Unorm);
         layer.setMaximumDrawableCount(3);
+        // not framebufferOnly: the screens get sampled, and so will the
+        // overlay work M2.1 picks up again
+        layer.setFramebufferOnly(false);
         layer.setDrawableSize(CGSize::new(
             (width.max(1) * scale as u32) as f64,
             (height.max(1) * scale as u32) as f64,
@@ -281,13 +271,9 @@ impl MetalPresenter {
             self.integer, self.stereo, false,
         );
 
-        let mut buffer_bytes: Vec<f32> = Vec::with_capacity(places.len() * 24);
-        for (viewport, _) in &places {
-            buffer_bytes.extend_from_slice(&quad_bytes(viewport, self.quads_for.1, false));
-        }
-
-        let mut textures: [Option<&Retained<ProtocolObject<dyn objc2_metal::MTLTexture>>>; 3] = [None, None, None];
-        for (viewport, shown) in &places {
+        // the screen textures the quads sample, uploaded from the CPU frames
+        let mut textures: [Option<Retained<ProtocolObject<dyn objc2_metal::MTLTexture>>>; 3] = [None, None, None];
+        for (_, shown) in &places {
             let image = match shown {
                 Shown::Top | Shown::Both => &top,
                 Shown::Right => if right.is_empty() { &top } else { &right },
@@ -297,19 +283,12 @@ impl MetalPresenter {
             if image.is_empty() || image.gpu.is_some() {
                 continue;
             }
-            if !self.upload_texture(index, image.pixels, image.width, image.height) {
-                continue;
+            if self.upload_texture(index, image.pixels, image.width, image.height) {
+                if let Some(screen) = &self.textures[index] {
+                    textures[index] = Some(screen.texture.clone());
+                }
             }
         }
-        let arity = buffer_bytes.len() / 6;
-        let quads_buffer: Retained<ProtocolObject<dyn objc2_metal::MTLBuffer>> = unsafe {
-            self.device
-                .newBufferWithBytes_length_options(
-                    std::ptr::NonNull::from(buffer_bytes.as_slice()).cast(),
-                    buffer_bytes.len() * 4,
-                    MTLResourceOptions::StorageModeShared,
-                )
-        } .ok_or("no quad buffer")?;
 
         let Some(drawable) = self.layer.nextDrawable() else {
             return Err(String::from("no drawable this frame"));
@@ -321,11 +300,10 @@ impl MetalPresenter {
         attachment.setTexture(Some(drawable.texture().as_ref()));
         attachment.setLoadAction(MTLLoadAction::Clear);
         attachment.setStoreAction(MTLStoreAction::Store);
-        let green = ((self.frames % 90) as f64 / 90.0).max(0.12);
         attachment.setClearColor(MTLClearColor {
             red: 0.04,
-            green,
-            blue: 0.22,
+            green: 0.05,
+            blue: 0.09,
             alpha: 1.0,
         });
 
@@ -338,29 +316,54 @@ impl MetalPresenter {
         unsafe {
             encoder.setRenderPipelineState(&self.pipeline);
 
-            encoder.setVertexBuffer_offset_atIndex(
-                Some(quads_buffer.as_ref()),
-                0,
-                0,
-            );
-            encoder.setFragmentTexture_atIndex(
-                textures[0].map(|texture| texture.as_ref()),
-                0,
-            );
+            // one draw per place: the vertex shader recognizes the quad's
+            // corners out of a 16-byte rect, no data buffer to carry, no
+            // pointer fetch over the old vertex array
             encoder.setFragmentSamplerState_atIndex(Some(self.sampler.as_ref()), 0);
-
-            encoder.drawPrimitives_vertexStart_vertexCount(
-                objc2_metal::MTLPrimitiveType::Triangle,
-                0,
-                (arity * 3) as usize,
-            );
+            let (cols, rows) = (self.quads_for.0 as f32, self.quads_for.1 as f32);
+            for (viewport, shown) in &places {
+                let image = match shown {
+                    Shown::Top | Shown::Both => &top,
+                    Shown::Right => if right.is_empty() { &top } else { &right },
+                    Shown::Bottom => &bottom,
+                };
+                if image.is_empty() || image.gpu.is_some() {
+                    continue;
+                }
+                let index = index_of(*shown);
+                if textures[index].is_none() {
+                    continue;
+                }
+                encoder.setFragmentTexture_atIndex(textures[index].as_deref(), 0);
+                let rect = [
+                    viewport.x / cols * 2.0 - 1.0,
+                    1.0 - (viewport.y + viewport.height) / rows * 2.0,
+                    (viewport.x + viewport.width) / cols * 2.0 - 1.0,
+                    1.0 - viewport.y / rows * 2.0,
+                ];
+                encoder.setVertexBytes_length_atIndex(
+                    std::ptr::NonNull::from(rect.as_slice()).cast(),
+                    rect.len() * 4,
+                    0,
+                );
+                encoder.drawPrimitives_vertexStart_vertexCount(
+                    objc2_metal::MTLPrimitiveType::Triangle,
+                    0,
+                    6,
+                );
+            }
             let encoder_ref: &AnyObject = encoder.as_ref();
             let _: () = objc2::msg_send![encoder_ref, endEncoding];
+            // the present itself: without this call the compositor never sees
+            // the frame — the window stays white while the game runs behind
+            let buffer_ref: &AnyObject = buffer.as_ref();
+            let drawable_object: &AnyObject = drawable.as_ref();
+            let _: () = objc2::msg_send![buffer_ref, presentDrawable: drawable_object];
         }
         buffer.commit();
         self.frames += 1;
         if self.frames == 1 {
-            log::info!("metal present v1: first frame dipped through, {} quads", arity);
+            log::info!("metal present v1: first frame dipped through, {} places", places.len());
         }
         Ok(())
     }
