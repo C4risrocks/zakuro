@@ -667,9 +667,10 @@ impl ApplicationHandler for App {
         if let Some(window) = &self.companion {
             window.request_redraw();
         }
-        // the desktop's monitors, listed while the settings are open for
-        // the second window's unsigned choice
-        if self.menus.settings_open && self.menus.monitors.is_empty() {
+        // the desktop's monitors, listed while the settings or the game's
+        // menu stay open for the second window's choices (they re-sync the
+        // list as displays come and go)
+        if self.menus.settings_open || self.menus.menu_open {
             self.menus.monitors = event_loop
                 .available_monitors()
                 .enumerate()
@@ -1846,7 +1847,7 @@ impl App {
         let overlay = gui.frame(window, |ui| {
             match &game {
                 Some((name, fps, recompiled)) => {
-                    actions.extend(menus.game(ui, name, show_fps.then_some(*fps), *recompiled, fast, jobs, saved.as_deref()));
+                    actions.extend(menus.game(ui, name, show_fps.then_some(*fps), *recompiled, fast, jobs, saved.as_deref(), settings));
                     if let Some(text) = &corner {
                         menus::corner(ui.ctx(), text);
                     }

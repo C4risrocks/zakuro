@@ -369,6 +369,7 @@ impl Menus {
         fast: bool,
         jobs: &[Job],
         saved: Option<&str>,
+        settings: &mut crate::settings::Settings,
     ) -> Vec<Action> {
         let mut actions = Vec::new();
         let ctx = ui.ctx().clone();
@@ -443,6 +444,34 @@ impl Menus {
                         actions.push(Action::LoadState);
                     }
                 });
+                ui.add_space(4.0);
+                // the second window, asked right from the game menu: the
+                // same say the settings' panel holds, applied live
+                let screens_before = (settings.companion_window, settings.companion_monitor);
+                ui.label(RichText::new("Screens").strong());
+                egui::ComboBox::from_label("Second window")
+                    .selected_text(settings.companion_window.name())
+                    .show_ui(ui, |ui| {
+                        for window in CompanionWindow::ALL {
+                            ui.selectable_value(&mut settings.companion_window, window, window.name());
+                        }
+                    });
+                if settings.companion_window != CompanionWindow::Off {
+                    egui::ComboBox::from_label("Second window's monitor")
+                        .selected_text(match settings.companion_monitor {
+                            Some(index) => self.monitors.iter().find(|(one, _)| *one == index).map_or(format!("Monitor {index}"), |(_, name)| name.clone()),
+                            None => "After the main window's".into(),
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut settings.companion_monitor, None, "After the main window's");
+                            for (index, name) in &self.monitors {
+                                ui.selectable_value(&mut settings.companion_monitor, Some(*index), name);
+                            }
+                        });
+                }
+                if (settings.companion_window, settings.companion_monitor) != screens_before {
+                    actions.push(Action::Settings);
+                }
                 ui.add_space(4.0);
                 if wide(ui, "Settings") {
                     self.settings_open = true;
