@@ -48,6 +48,11 @@ const TRANSFER_COMP: &str = include_str!("../../shaders/transfer.comp");
 const DEPTH_COMP: &str = include_str!("../../shaders/depth.comp");
 const UPRIGHT_COMP: &str = include_str!("../../shaders/upright.comp");
 
+/// the fragment raster's spec constants, by `constant_id`, the words of
+/// the Vulkan pipeline's specialization — the values a Metal compile bakes
+/// in (naga flattens them to plain constants).
+pub const FRAGMENT_CONSTANTS: usize = 30;
+
 /// The GLSL that built the SPIR-V is straight Vulkan dialect; naga's `glsl`
 /// front only understands part of it, and this closes the gap without a
 /// single change in meaning:
@@ -58,18 +63,51 @@ const UPRIGHT_COMP: &str = include_str!("../../shaders/upright.comp");
 ///   Metal pipelines configure through defines instead of spec values.
 /// The rewrite is line-shaped and textual on sources this port owns; the
 /// rack test keeps the whole thing honest.
-fn prepare(source: &str) -> String {
+fn prepare(
+    source: &str,
+    values: Option<&[u32; FRAGMENT_CONSTANTS]>,
+    to_image: bool,
+) -> String {
     let mut sampler_names: Vec<(u32, u32, String)> = Vec::new();
     let mut lines = String::with_capacity(source.len() + 512);
     for line in source.lines() {
         let trimmed = line.trim_start();
         if trimmed.contains("constant_id") && trimmed.contains(") const") {
-            // layout(constant_id = 29) const uint DYNAMIC = 0u; → const …
+            // layout(constant_id = 29) const uint DYNAMIC = 0u; → the
+            // const with the value the pipeline's key baked in (naga's MSL
+            // writer refuses spec overrides), or the source's own default
             if let Some(after) = trimmed.find(") const") {
-                lines.push_str(&trimmed[after + 2..]);
+                let head = &trimmed[after + 2..];
+                if let Some(values) = values {
+                    // `const uint NAME = value;` — the id ranks the spec
+                    // word the pipeline key carries; the name rebuild without
+                    // its own const (the head has it already)
+                    let id: u32 = trimmed
+                        .split("constant_id = ")
+                        .nth(1)
+                        .and_then(|id_part| id_part.split(')').next())
+                        .and_then(|id| id.parse().ok())
+                        .unwrap_or(0);
+                    let value = values.get(id as usize).copied().unwrap_or(0);
+                    let name = head.split('=').next().unwrap_or("").trim();
+                    let line = format!("{name} = {value}u;");
+                    lines.push_str(&line);
+                    lines.push('\n');
+                    continue;
+                }
+                lines.push_str(head);
                 lines.push('\n');
                 continue;
             }
+        }
+        if to_image && trimmed.contains("buffer Upright") {
+            // the image variant writes the image, so the SSBO moves to a
+            // free binding (the two shared Vulkan binding 1 otherwise)
+            lines.push_str(
+                &line.replace("binding = 1)", "binding = 2)"),
+            );
+            lines.push('\n');
+            continue;
         }
         if trimmed.contains("writeonly buffer") {
             // naga's IR can't carry a store-only storage buffer (the Metal
@@ -178,8 +216,24 @@ impl Translated {
         stage: ShaderStage,
         defines: &[(&str, &str)],
     ) -> Result<Self, String> {
+        Self::keyed(name, source, stage, defines, None)
+    }
+
+    fn keyed(
+        name: &'static str,
+        source: &str,
+        stage: ShaderStage,
+        defines: &[(&str, &str)],
+        values: Option<&[u32; FRAGMENT_CONSTANTS]>,
+    ) -> Result<Self, String> {
         let started = std::time::Instant::now();
-        let (msl, entry) = glsl::compile_msl_stage_entry(&prepare(source), stage, defines)?;
+        let to_image = defines.iter().any(|(name, _)| *name == "TO_IMAGE");
+        let (msl, entry) = glsl::compile_msl_stage_entry(
+            &prepare(source, values, to_image),
+            stage,
+            defines,
+            None,
+        )?;
         let microseconds = started.elapsed().as_micros();
         Ok(Self { name, msl, entry, microseconds })
     }
@@ -420,12 +474,11 @@ pub struct PipelineKey {
 #[cfg(all(target_os = "macos", feature = "metal"))]
 mod tests {
     use super::*;
-    use objc2_metal::MTLPixelFormat;
-    use objc2_metal::{MTLCommandQueue as _, MTLDevice as _};
+    use objc2_metal::{MTLDevice as _, MTLPixelFormat};
 
     #[test]
     fn pixel_formats_match_the_vulkan_twins() {
-        // Vulkan's COLOR_FORMAT and DEPTH_FORMAT with its float fallback
+        // Vulkan's COLOR_FORMAT and its depth twin with the float fallback
         assert_eq!(COLOR_PIXEL_FORMAT, MTLPixelFormat::RGBA8Unorm);
         assert_eq!(depth_pixel_format(false), MTLPixelFormat::Depth24Unorm_Stencil8);
         assert_eq!(depth_pixel_format(true), MTLPixelFormat::Depth32Float_Stencil8);
@@ -434,12 +487,8 @@ mod tests {
     #[test]
     fn default_pipelines_build_on_the_device() {
         let hardware = HardwareMetal::new().expect("the Metal raster constructs");
-        // the default pipelines; debug: the float twin bisects the
-        // descriptor crash (Apple silicon may not render D24S8)
-        let float_depth = true;
-        let depth = true;
-        let depth = float_depth;
-        for depth in [depth] {
+        // the float twin is what Apple silicon renders (the D24 rejects)
+        for (depth, float_depth) in [(true, true), (false, true)] {
             let pipeline = hardware
                 .graphics_pipeline(
                     "raster.vert",
@@ -449,7 +498,7 @@ mod tests {
                 .expect("the default pipelines construct");
             let _ = pipeline;
         }
-        // the libraries: every rack shader carries a main
+        // every rack shader hands back its function
         for shader in [
             "shade.vert", "raster.vert", "raster.frag", "raster_depth.frag",
             "transfer.comp", "depth.comp", "upright.comp", "upright_image.comp",
@@ -467,21 +516,21 @@ mod tests {
     #[test]
     fn a_draw_runs_through_the_pipeline_to_pixels() {
         use objc2_metal::{
-            MTLClearColor, MTLLoadAction, MTLRegion, MTLOrigin, MTLResourceOptions,
+            MTLClearColor, MTLLoadAction, MTLPrimitiveType, MTLRegion, MTLOrigin,
+            MTLRenderPipelineDescriptor, MTLRenderPassDescriptor, MTLResourceOptions,
             MTLStorageMode, MTLStoreAction, MTLTextureDescriptor, MTLTextureUsage,
-            MTLVertexFormat, MTLVertexStepFunction, MTLVertexDescriptor,
-            MTLRenderPipelineDescriptor, MTLDevice as _, MTLRenderCommandEncoder as _,
-            MTLCommandBuffer as _,
+            MTLVertexDescriptor, MTLVertexFormat, MTLVertexStepFunction,
+            MTLCommandBuffer as _, MTLTexture as _, MTLDevice as _,
+            MTLRenderCommandEncoder as _, MTLRenderPipelineState as _,
         };
         use objc2::runtime::AnyObject;
         use std::ptr::NonNull;
 
-        // inline GLSL → the SAME translation path the rack takes
         let (vertex_msl, vertex_entry) = glsl::compile_msl_stage_entry(
-            &tri_vertex(), ShaderStage::Vertex, &[],
+            &tri_vertex(), ShaderStage::Vertex, &[], None,
         ).expect("the test vertex shader translates");
         let (fragment_msl, fragment_entry) = glsl::compile_msl_stage_entry(
-            &tri_fragment(), ShaderStage::Fragment, &[],
+            &tri_fragment(), ShaderStage::Fragment, &[], None,
         ).expect("the test fragment shader translates");
 
         let hardware = HardwareMetal::new().expect("the Metal raster constructs");
@@ -540,7 +589,7 @@ mod tests {
         ];
         let vertex_buffer = unsafe {
             hardware.device.newBufferWithBytes_length_options(
-                NonNull::from(vertices.as_ref()).cast(),
+                std::ptr::NonNull::from(vertices.as_slice()).cast(),
                 vertices.len() * 4,
                 MTLResourceOptions::StorageModeShared,
             )
@@ -562,7 +611,7 @@ mod tests {
             .expect("the render target allocates");
 
         // the frame: clear to the presenter's letterbox navy, draw green
-        let pass = objc2_metal::MTLRenderPassDescriptor::new();
+        let pass = MTLRenderPassDescriptor::new();
         unsafe {
             let attachments = pass.colorAttachments();
             let attachment: Retained<objc2_metal::MTLRenderPassColorAttachmentDescriptor> =
@@ -571,10 +620,7 @@ mod tests {
             attachment.setLoadAction(MTLLoadAction::Clear);
             attachment.setStoreAction(MTLStoreAction::Store);
             attachment.setClearColor(MTLClearColor {
-                red: 0.04,
-                green: 0.05,
-                blue: 0.09,
-                alpha: 1.0,
+                red: 0.04, green: 0.05, blue: 0.09, alpha: 1.0,
             });
         }
         let buffer = hardware.queue.commandBuffer().expect("the command buffer");
@@ -583,19 +629,16 @@ mod tests {
         unsafe {
             encoder.setRenderPipelineState(&spinner);
             encoder.setVertexBuffer_offset_atIndex(Some(vertex_buffer.as_ref()), 0, 0);
-            encoder.drawPrimitives_vertexStart_vertexCount(
-                objc2_metal::MTLPrimitiveType::Triangle, 0, 3,
-            );
+            encoder.drawPrimitives_vertexStart_vertexCount(MTLPrimitiveType::Triangle, 0, 3);
             let encoder_ref: &AnyObject = encoder.as_ref();
             let _: () = objc2::msg_send![encoder_ref, endEncoding];
         }
         buffer.commit();
         buffer.waitUntilCompleted();
 
-        // read the pixels back out of the Managed target
+        // read the pixels back and prove the triangle drew
         let mut pixels = [0u8; WIDTH * HEIGHT * 4];
         unsafe {
-            use objc2_metal::MTLTexture as _;
             target.getBytes_bytesPerRow_fromRegion_mipmapLevel(
                 NonNull::from(pixels.as_mut_slice()).cast(),
                 WIDTH * 4,
@@ -607,9 +650,7 @@ mod tests {
             );
         }
 
-        // the raster draws green in the triangle, and only there: the
-        // lower-left of the screen is green, the upper-right navy, and the
-        // diagonal the triangle's own edge.
+        // the raster draws green in the triangle, and only there
         let screen = |x: usize, y: usize| {
             let at = (y * WIDTH + x) * 4;
             [pixels[at], pixels[at + 1], pixels[at + 2], pixels[at + 3]]
@@ -620,6 +661,252 @@ mod tests {
         assert_eq!(screen(1, 2), green, "just past the top-left tip");
         assert_eq!(screen(28, 2), navy, "the top-right is outside");
         assert_eq!(screen(28, 28), navy, "the bottom-right is outside");
+    }
+
+    /// A3b: the raster's real fragment semantics over the draw block — the
+    /// DYNAMIC path reads tev/misc/units from the uniforms, the combiner
+    /// stages hand the vertex colour straight through, and the resource
+    /// bindings map to the Vulkan bindings' numbers (textures 0..2, the
+    /// buffer 3 the draw block, 4 the tables, samplers 10..12).
+    #[test]
+    fn the_raster_fragment_reads_the_draw_block() {
+        use naga::back::msl as naga_msl;
+        use objc2::runtime::AnyObject;
+        use objc2_metal::{
+            MTLClearColor, MTLLoadAction, MTLPrimitiveType, MTLRegion, MTLOrigin,
+            MTLRenderPassDescriptor, MTLResourceOptions, MTLStorageMode, MTLStoreAction,
+            MTLTextureDescriptor, MTLTextureUsage, MTLVertexDescriptor,
+            MTLVertexFormat, MTLVertexStepFunction, MTLRenderPipelineDescriptor,
+            MTLCommandBuffer as _, MTLTexture as _, MTLDevice as _,
+            MTLRenderCommandEncoder as _, MTLRenderPipelineState as _,
+        };
+        use std::ptr::NonNull;
+
+        // the generic decode: DYNAMIC on, everything else 0
+        let mut key = [0u32; FRAGMENT_CONSTANTS];
+        key[29] = 1;
+
+        let prepared_fragment = prepare(RASTER_FRAG, Some(&key), false);
+        let prepared_vertex = prepare(RASTER_VERT, None, false);
+
+        // the bindings verbatim, keyed to the entry point's own name `main`
+        let mut fragment_bindings = naga_msl::BindingMap::default();
+        for binding in 0..3u32 {
+            fragment_bindings.insert(
+                naga::ResourceBinding { group: 0, binding },
+                naga_msl::BindTarget { texture: Some(binding as u8), ..Default::default() },
+            );
+        }
+        fragment_bindings.insert(
+            naga::ResourceBinding { group: 0, binding: 3 },
+            naga_msl::BindTarget { buffer: Some(3), ..Default::default() },
+        );
+        fragment_bindings.insert(
+            naga::ResourceBinding { group: 0, binding: 4 },
+            naga_msl::BindTarget { buffer: Some(4), ..Default::default() },
+        );
+        for slot in 10..13 {
+            fragment_bindings.insert(
+                naga::ResourceBinding { group: 0, binding: slot },
+                naga_msl::BindTarget {
+                    sampler: Some(naga_msl::BindSamplerTarget::Resource(slot as u8)),
+                    ..Default::default()
+                },
+            );
+        }
+        let mut per_entry = naga_msl::EntryPointResourceMap::default();
+        per_entry.insert(String::from("main"), naga_msl::EntryPointResources {
+            resources: fragment_bindings,
+            // the Tables' runtime-sized array needs its host-sized buffer
+            sizes_buffer: Some(30),
+            ..Default::default()
+        });
+
+        let (fragment_msl, fragment_entry) = glsl::compile_msl_stage_entry(
+            &prepared_fragment, ShaderStage::Fragment, &[], Some(&per_entry),
+        ).expect("the keyed fragment translates");
+        let (vertex_msl, vertex_entry) = glsl::compile_msl_stage_entry(
+            &prepared_vertex, ShaderStage::Vertex, &[], None,
+        ).expect("the vertex translates");
+        println!("=== the keyed raster.frag MSL ===\n{fragment_msl}\n=== end ===");
+
+        let hardware = HardwareMetal::new().expect("the Metal raster constructs");
+        let vertex_library = hardware.device
+            .newLibraryWithSource_options_error(&NSString::from_str(&vertex_msl), None)
+            .expect("the vertex MSL compiles");
+        let fragment_library = hardware.device
+            .newLibraryWithSource_options_error(&NSString::from_str(&fragment_msl), None)
+            .expect("the fragment MSL compiles");
+        let vertex_function = vertex_library.newFunctionWithName(&ns(&vertex_entry))
+            .expect("the vertex main");
+        let fragment_function = fragment_library.newFunctionWithName(&ns(&fragment_entry))
+            .expect("the fragment main");
+
+        // the pipeline: the descriptor A2's builder lays out, the real
+        // functions and the float twin's depth (D32F_S8)
+        let descriptor = MTLRenderPipelineDescriptor::new();
+        let depth_format = depth_pixel_format(true);
+        descriptor.setStencilAttachmentPixelFormat(depth_format);
+        descriptor.setDepthAttachmentPixelFormat(depth_format);
+        unsafe {
+            let attachments = descriptor.colorAttachments();
+            let colour: Retained<objc2_metal::MTLRenderPipelineColorAttachmentDescriptor> =
+                attachments.objectAtIndexedSubscript(0);
+            colour.setPixelFormat(MTLPixelFormat::RGBA8Unorm);
+        }
+        descriptor.setRasterSampleCount(1);
+        descriptor.setVertexFunction(Some(vertex_function.as_ref()));
+        descriptor.setFragmentFunction(Some(fragment_function.as_ref()));
+        let vertex_descriptor: Retained<MTLVertexDescriptor> = MTLVertexDescriptor::vertexDescriptor();
+        unsafe {
+            let attributes = vertex_descriptor.attributes();
+            for location in 0..6 {
+                let attribute: Retained<objc2_metal::MTLVertexAttributeDescriptor> =
+                    attributes.objectAtIndexedSubscript(location);
+                attribute.setFormat(MTLVertexFormat::Float4);
+                attribute.setOffset(location * 16);
+                attribute.setBufferIndex(0);
+            }
+            let layouts = vertex_descriptor.layouts();
+            let layout: Retained<objc2_metal::MTLVertexBufferLayoutDescriptor> =
+                layouts.objectAtIndexedSubscript(0);
+            layout.setStride(96);
+            layout.setStepFunction(MTLVertexStepFunction::PerVertex);
+            descriptor.setVertexDescriptor(Some(&vertex_descriptor));
+        }
+        let pipeline = unsafe {
+            hardware.device.newRenderPipelineStateWithDescriptor_error(&descriptor)
+        }.expect("the keyed pipeline constructs");
+
+        // the draw block: the six stages pass the vertex colour through
+        let mut uniforms = [0u8; 1504];
+        let mut word = |offset: usize, value: u32| {
+            uniforms[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        };
+        for stage in 0..6 {
+            let at = stage * 16;
+            word(at, 0x000F_000F);     // the sources: the all-ones pass form
+            word(at + 4, 0x0000_0000); // the operands: none altered
+            word(at + 8, 0x000F_000F); // the combiners: the pass shape
+            word(at + 12, 0);
+        }
+        let uniforms_buffer = unsafe {
+            hardware.device.newBufferWithBytes_length_options(
+                NonNull::from(uniforms.as_ref()).cast(),
+                uniforms.len(),
+                MTLResourceOptions::StorageModeShared,
+            )
+        }.expect("the uniforms allocate");
+        let tables = vec![0u32; 65536];
+        let tables_buffer = unsafe {
+            hardware.device.newBufferWithBytes_length_options(
+                std::ptr::NonNull::from(tables.as_slice()).cast(),
+                tables.len() * 4,
+                MTLResourceOptions::StorageModeShared,
+            )
+        }.expect("the tables allocate");
+
+        // six placed vertices: the left triangle green, the right red
+        let vertex = |x: f32, y: f32, r: f32, g: f32, b: f32| -> [f32; 24] {
+            let mut data = [0.0f32; 24];
+            data[0] = x; data[1] = y; data[3] = 1.0;
+            data[4] = r; data[5] = g; data[6] = b; data[7] = 1.0;
+            data[14] = 0.5;
+            data
+        };
+        let mut vertices = Vec::with_capacity(24 * 6);
+        for (position, (r, g, b)) in [
+            ((-1.0f32, -1.0f32), (0.0f32, 1.0f32, 0.0f32)),
+            ((0.0f32, -1.0f32), (0.0f32, 1.0f32, 0.0f32)),
+            ((-1.0f32, 1.0f32), (0.0f32, 1.0f32, 0.0f32)),
+            ((0.0f32, -1.0f32), (1.0f32, 0.0f32, 0.0f32)),
+            ((1.0f32, -1.0f32), (1.0f32, 0.0f32, 0.0f32)),
+            ((1.0f32, 1.0f32), (1.0f32, 0.0f32, 0.0f32)),
+        ] {
+            vertices.extend(vertex(position.0, position.1, r, g, b));
+        }
+        let vertex_buffer = unsafe {
+            hardware.device.newBufferWithBytes_length_options(
+                std::ptr::NonNull::from(vertices.as_slice()).cast(),
+                vertices.len() * 4,
+                MTLResourceOptions::StorageModeShared,
+            )
+        }.expect("the vertices allocate");
+
+        // the targets: colour and depth (the pipeline declares both)
+        const WIDTH: usize = 32;
+        const HEIGHT: usize = 32;
+        let color_descriptor = MTLTextureDescriptor::new();
+        color_descriptor.setPixelFormat(MTLPixelFormat::RGBA8Unorm);
+        unsafe {
+            color_descriptor.setWidth(WIDTH);
+            color_descriptor.setHeight(HEIGHT);
+        }
+        color_descriptor.setUsage(MTLTextureUsage::RenderTarget | MTLTextureUsage::ShaderRead);
+        color_descriptor.setStorageMode(MTLStorageMode::Managed);
+        let color_target = hardware.device.newTextureWithDescriptor(&color_descriptor)
+            .expect("the colour target allocates");
+        let depth_descriptor = MTLTextureDescriptor::new();
+        depth_descriptor.setPixelFormat(MTLPixelFormat::Depth32Float_Stencil8);
+        unsafe {
+            depth_descriptor.setWidth(WIDTH);
+            depth_descriptor.setHeight(HEIGHT);
+        }
+        depth_descriptor.setUsage(MTLTextureUsage::RenderTarget);
+        depth_descriptor.setStorageMode(MTLStorageMode::Managed);
+        let depth_target = hardware.device.newTextureWithDescriptor(&depth_descriptor)
+            .expect("the depth target allocates");
+
+        let pass = MTLRenderPassDescriptor::new();
+        unsafe {
+            let attachments = pass.colorAttachments();
+            let colour: Retained<objc2_metal::MTLRenderPassColorAttachmentDescriptor> =
+                attachments.objectAtIndexedSubscript(0);
+            colour.setTexture(Some(color_target.as_ref()));
+            colour.setLoadAction(MTLLoadAction::Clear);
+            colour.setStoreAction(MTLStoreAction::Store);
+            colour.setClearColor(MTLClearColor { red: 0.04, green: 0.05, blue: 0.09, alpha: 1.0 });
+            let depth = pass.depthAttachment();
+            depth.setTexture(Some(depth_target.as_ref()));
+            depth.setLoadAction(MTLLoadAction::Clear);
+            depth.setStoreAction(MTLStoreAction::Store);
+            depth.setClearDepth(1.0);
+        }
+        let buffer = hardware.queue.commandBuffer().expect("the command buffer");
+        let encoder = unsafe { buffer.renderCommandEncoderWithDescriptor(&pass) }
+            .expect("the render encoder");
+        unsafe {
+            encoder.setRenderPipelineState(&pipeline);
+            encoder.setVertexBuffer_offset_atIndex(Some(vertex_buffer.as_ref()), 0, 0);
+            encoder.setFragmentBuffer_offset_atIndex(Some(uniforms_buffer.as_ref()), 0, 3);
+            encoder.setFragmentBuffer_offset_atIndex(Some(tables_buffer.as_ref()), 0, 4);
+            encoder.drawPrimitives_vertexStart_vertexCount(MTLPrimitiveType::Triangle, 0, 6);
+            let encoder_ref: &AnyObject = encoder.as_ref();
+            let _: () = objc2::msg_send![encoder_ref, endEncoding];
+        }
+        buffer.commit();
+        buffer.waitUntilCompleted();
+
+        let mut pixels = [0u8; WIDTH * HEIGHT * 4];
+        unsafe {
+            color_target.getBytes_bytesPerRow_fromRegion_mipmapLevel(
+                NonNull::from(pixels.as_mut_slice()).cast(),
+                WIDTH * 4,
+                MTLRegion {
+                    origin: MTLOrigin { x: 0, y: 0, z: 0 },
+                    size: objc2_metal::MTLSize { width: WIDTH, height: HEIGHT, depth: 1 },
+                },
+                0,
+            );
+        }
+        let screen = |x: usize, y: usize| {
+            let at = (y * WIDTH + x) * 4;
+            [pixels[at], pixels[at + 1], pixels[at + 2], pixels[at + 3]]
+        };
+        assert_eq!(screen(8, 24), [0u8, 255, 0, 255], "the green left half");
+        assert_eq!(screen(24, 24), [255u8, 0, 0, 255], "the red right half");
+        assert_eq!(screen(8, 2), [10u8, 13, 23, 255], "the letterbox top");
+        assert_eq!(screen(24, 2), [10u8, 13, 23, 255], "the letterbox top right");
     }
 }
 

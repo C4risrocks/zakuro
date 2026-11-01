@@ -106,7 +106,8 @@ pub(crate) fn compile(source: &str) -> Result<Vec<u32>, String> {
 /// Metal, so the buffers get sequential indexes the spike wires by hand.
 #[cfg(feature = "msl-out")]
 pub(crate) fn compile_msl(source: &str) -> Result<String, String> {
-    let (text, entry) = compile_msl_stage_entry(source, naga::ShaderStage::Vertex, &[])?;
+    let (text, entry) =
+        compile_msl_stage_entry(source, naga::ShaderStage::Vertex, &[], None)?;
     Ok(format!("// entry: {entry:?}\n{text}"))
 }
 
@@ -119,6 +120,7 @@ pub(crate) fn compile_msl_stage_entry(
     source: &str,
     stage: naga::ShaderStage,
     defines: &[(&str, &str)],
+    entry_bindings: Option<&naga::back::msl::EntryPointResourceMap>,
 ) -> Result<(String, String), String> {
     use naga::back::msl;
     use naga::front::glsl;
@@ -146,7 +148,14 @@ pub(crate) fn compile_msl_stage_entry(
         // the resource slots the descriptors name, as the spike does
         // the writer mangles the entry (`main` becomes `main0`…) and its
         // returned value is the name the pipeline must bind the function by
-        let options = msl::Options::default();
+        let options = match entry_bindings {
+            Some(map) => msl::Options {
+                per_entry_point_map: map.clone(),
+                fake_missing_bindings: false,
+                ..msl::Options::default()
+            },
+            None => msl::Options::default(),
+        };
         let pipeline = msl::PipelineOptions::default();
         let mut text = String::new();
         let entry = naga_msl_entry(&mut text, &module, &info, &options, &pipeline)?;
@@ -167,22 +176,17 @@ fn naga_msl_entry(
     let translation = msl::Writer::new(text)
         .write(module, info, options, pipeline)
         .map_err(|error| error.to_string())?;
-    let name = translation
-        .entry_point_names
-        .first()
-        .and_then(|entry| entry.as_ref().ok())
-        .cloned()
-        .ok_or_else(|| String::from("the MSL entry point mangled itself away"))?;
+    // names carry either the final MSL name or why the entry failed —
+    // surface both so the map's mistakes read in the tests
+    let name = match translation.entry_point_names.first() {
+        Some(Ok(name)) => name.clone(),
+        Some(Err(error)) => {
+            println!("M1.1 entry names failed: {error:?}");
+            return Err(format!("the MSL entry failed: {error}"));
+        }
+        None => format!("__none-{}__", translation.entry_point_names.len()),
+    };
     Ok(name)
-}
-
-#[cfg(feature = "msl-out")]
-pub(crate) fn compile_msl_entry_point(
-    source: &str,
-    stage: naga::ShaderStage,
-    defines: &[(&str, &str)],
-) -> Result<(String, String), String> {
-    compile_msl_stage_entry(source, stage, defines)
 }
 
 /// instructions from one address up to the next place execution can come
