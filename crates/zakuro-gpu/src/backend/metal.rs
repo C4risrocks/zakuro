@@ -123,10 +123,14 @@ struct Metal {
     queue: Retained<ProtocolObject<dyn objc2_metal::MTLCommandQueue>>,
     pipeline: Retained<ProtocolObject<dyn objc2_metal::MTLRenderPipelineState>>,
     sampler: Retained<ProtocolObject<dyn objc2_metal::MTLSamplerState>>,
-    // two texture sets ping-pong so the upload of a frame never points a
-    // write at a texture the previous job's draw is still sampling
-    textures: [[Option<ScreenTexture>; 3]; 2],
-    flip: bool,
+    // three texture sets round-robin: the channel carries at most one
+    // queued frame while another is being worked, so the GPU can still be
+    // sampling the set the turn before last — the worker synchronises
+    // (waitUntilCompleted) on one set's previous buffer before reusing it
+    textures: [[Option<ScreenTexture>; 3]; 3],
+    /// the last job's buffer that sampled each set, for P2-7's re-use sync
+    samplers: [Option<Retained<ProtocolObject<dyn objc2_metal::MTLCommandBuffer>>>; 3],
+    flip: usize,
     // the drawable size the layer already carries, so it only gets set
     // when the window actually changed it
     resized: (f64, f64),
@@ -142,7 +146,7 @@ impl Metal {
         let sized = |texture: &ScreenTexture| {
             texture.width == width && texture.height == height
         };
-        let set = usize::from(self.flip);
+        let set = self.flip;
         if !self.textures[set][index].as_ref().is_some_and(sized) {
             let descriptor = MTLTextureDescriptor::new();
             descriptor.setPixelFormat(MTLPixelFormat::RGBA8Unorm);
@@ -167,6 +171,15 @@ impl Metal {
         self.textures[set][index]
             .as_ref()
             .map(|screen_texture| &screen_texture.texture)
+    }
+
+    /// synchronises with the job that sampled this set before its textures
+    /// get new bytes — P2-7's re-use barrier
+    fn await_at_rest(&mut self) {
+        if let Some(previous) = self.samplers[self.flip].take() {
+            use objc2_metal::MTLCommandBuffer as _;
+            previous.waitUntilCompleted();
+        }
     }
 
     fn upload(
@@ -220,7 +233,11 @@ fn present_worker(mut metal: Metal, jobs: mpsc::Receiver<Frame>, config: Arc<Mut
         };
         let cfg = *config.lock().unwrap();
         let places = place(width, height, cfg.arrangement, cfg.top_width, cfg.integer, frame.stereo, false);
-        metal.flip = !metal.flip;
+        // round-robin over three texture sets; before its turn, the one
+        // from the turn before-last is still possibly being sampled by the
+        // GPU, so the reuse waits for that job to finish (P2-7)
+        metal.flip = (metal.flip + 1) % 3;
+        metal.await_at_rest();
 
         let drawable = unsafe { metal.layer.0.nextDrawable() };
         let Some(drawable) = drawable else {
@@ -299,6 +316,8 @@ fn present_worker(mut metal: Metal, jobs: mpsc::Receiver<Frame>, config: Arc<Mut
             let _: () = objc2::msg_send![buffer_ref, presentDrawable: drawable_object];
         }
         buffer.commit();
+        // remember this job so the next reuse of this set waits on it (P2-7)
+        metal.samplers[metal.flip] = Some(buffer.clone());
         done.fetch_add(1, Ordering::Relaxed);
         let _ = frame;
     }
@@ -319,6 +338,8 @@ pub struct MetalPresenter {
     jobs: Option<mpsc::SyncSender<Frame>>,
     config: Arc<Mutex<Config>>,
     done: Arc<AtomicU64>,
+    // P2-8: frames the loop dropped when the worker was a frame behind
+    skipped: AtomicU64,
     // the window's geometry, updated by resize() and stamped on each job
     // (the worker re-applies the layer's drawable size with it)
     width: u32,
@@ -382,8 +403,9 @@ impl MetalPresenter {
             queue,
             pipeline,
             sampler,
-            textures: [[None, None, None], [None, None, None]],
-            flip: false,
+            textures: [[None, None, None], [None, None, None], [None, None, None]],
+            samplers: [None, None, None],
+            flip: 0,
             // seeded with the initial size so the worker's first frame
             // doesn't re-set what new() already set
             resized: (
@@ -408,6 +430,7 @@ impl MetalPresenter {
             jobs: Some(jobs_tx),
             config,
             done,
+            skipped: AtomicU64::new(0),
             width: width.max(1),
             height: height.max(1),
             scale,
@@ -472,17 +495,39 @@ impl MetalPresenter {
             scale: self.scale,
         };
         let jobs = self.jobs.as_ref().ok_or("no Metal present thread")?;
-        if jobs.send(frame).is_err() {
-            return Err("the Metal present thread stopped taking frames".to_owned());
+        match jobs.try_send(frame) {
+            Ok(()) => Ok(()),
+            // P2-8: the worker is a frame behind — dropping this FRAME keeps
+            // the emulation loop free from present backpressure; the next
+            // one carries the whole picture again (the screens are
+            // instantaneous, nothing accumulates)
+            Err(mpsc::TrySendError::Full(_)) => {
+                let skipped = self.skipped.fetch_add(1, Ordering::Relaxed);
+                if skipped == 0 || (skipped + 1) % 240 == 0 {
+                    log::warn!(
+                        "metal present: the worker is a frame behind, frame {} dropped ({} so far)",
+                        skipped + 1,
+                        skipped + 1
+                    );
+                }
+                Ok(())
+            }
+            Err(mpsc::TrySendError::Disconnected(_)) => {
+                Err("the Metal present thread stopped taking frames".to_owned())
+            }
         }
-        Ok(())
     }
 
     pub fn report(&self) -> String {
         let seconds = self.started.elapsed().as_secs_f64();
         let frames = self.done.load(Ordering::Relaxed);
         let fps = if seconds > 1.0 { frames as f64 / seconds } else { 0.0 };
-        format!("metal present: {} frames in {:.3}s ({:.1} fps)", frames, seconds, fps)
+        let skipped = self.skipped.load(Ordering::Relaxed);
+        if skipped > 0 {
+            format!("metal present: {} frames in {:.3}s ({:.1} fps), {} dropped behind the worker", frames, seconds, fps, skipped)
+        } else {
+            format!("metal present: {} frames in {:.3}s ({:.1} fps)", frames, seconds, fps)
+        }
     }
 }
 
