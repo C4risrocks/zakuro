@@ -8,7 +8,8 @@ license.workspace = true
 default = ["jit"]
 opengl = ["dep:glow"]
 vulkan = ["dep:ash", "dep:ash-window", "dep:naga"]
-metal = ["dep:objc2", "dep:objc2-foundation", "dep:objc2-metal", "dep:objc2-quartz-core", "dep:objc2-core-graphics", "dep:objc2-core-foundation", "dep:objc2-app-kit"]
+msl-out = ["naga/msl-out"]
+metal = ["dep:objc2", "dep:objc2-foundation", "dep:objc2-metal", "dep:objc2-quartz-core", "dep:objc2-core-graphics", "dep:objc2-core-foundation", "dep:objc2-app-kit", "dep:naga", "msl-out"]
 # the shaders the CPU runs compiled to the host's code instead of interpreted
 jit = ["dep:cranelift-codegen", "dep:cranelift-frontend", "dep:cranelift-jit", "dep:cranelift-module", "dep:cranelift-native"]
 
@@ -31,7 +32,7 @@ ash = { version = "0.38", optional = true, default-features = false, features = 
 ash-window = { version = "0.13", optional = true }
 # turns translated vertex shaders into SPIR-V. wgsl-in only so 30.0.1 builds,
 # its glsl-in needs code it gates on wgsl-in
-naga = { version = "30.0.1", optional = true, features = ["glsl-in", "wgsl-in", "spv-out"] }
+naga = { version = "30.0.1", optional = true, features = ["glsl-in", "wgsl-in", "spv-out", "msl-out"] }
 # 0.135 is the last that builds with Rust 1.95
 cranelift-codegen = { version = "0.135", optional = true }
 cranelift-frontend = { version = "0.135", optional = true }

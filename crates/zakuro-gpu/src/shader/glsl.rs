@@ -100,6 +100,35 @@ pub(crate) fn compile(source: &str) -> Result<Vec<u32>, String> {
     std::panic::catch_unwind(run).unwrap_or_else(|_| Err("naga panicked".to_owned()))
 }
 
+/// a vertex program in GLSL translated to the Metal Shading Language for the
+/// Metal presenter (M0.5), or why not. naga's panics are errors as well. the
+/// GLSL's resources carry Vulkan bindings; the writer needs them mapped to
+/// Metal, so the buffers get sequential indexes the spike wires by hand.
+#[cfg(feature = "msl-out")]
+pub(crate) fn compile_msl(source: &str) -> Result<String, String> {
+    use naga::back::msl;
+    use naga::front::glsl;
+    use naga::valid::{Capabilities, ValidationFlags, Validator};
+    let run = || -> Result<String, String> {
+        let module = glsl::Frontend::default()
+            .parse(&glsl::Options::from(naga::ShaderStage::Vertex), source)
+            .map_err(|errors| errors.emit_to_string_with_path(source, "translated vertex shader"))?;
+        let info = Validator::new(ValidationFlags::all(), Capabilities::empty())
+            .validate(&module)
+            .map_err(|error| error.emit_to_string_with_path(source, "translated vertex shader"))?;
+        // the default options keep fake_missing_bindings on: the spike draws
+        // with dummies in the resource slots, the timing goal of M0.5
+        let options = msl::Options::default();
+        let pipeline = msl::PipelineOptions::default();
+        let mut text = String::new();
+        msl::Writer::new(&mut text)
+            .write(&module, &info, &options, &pipeline)
+            .map(|translation| format!("// entry: {translation:?}\n{text}"))
+            .map_err(|error| error.to_string())
+    };
+    std::panic::catch_unwind(run).unwrap_or_else(|_| Err("naga panicked".to_owned()))
+}
+
 /// instructions from one address up to the next place execution can come
 /// in at or go elsewhere.
 struct Run {
@@ -1040,5 +1069,48 @@ mod tests {
         let unit = unit(&program, 0, &mut random);
         let glsl = compiles(&unit, &semantics(&mut random));
         assert!(glsl.contains("pc = 4096u;"), "{glsl}");
+    }
+
+    /// the M0.5 spike: the program's GLSL translates to the Metal Shading
+    /// Language and a real Metal device compiles it the spike presenter's
+    /// way. the totals say whether a GPU-shaded PICA program is cheap
+    /// enough on Metal to hand it the vertices again.
+    #[cfg(all(target_os = "macos", feature = "msl-out", feature = "metal"))]
+    #[test]
+    fn programs_translate_to_msl_and_the_device_compiles() {
+        use objc2_metal::{MTLCreateSystemDefaultDevice, MTLDevice as _};
+
+        let started = std::time::Instant::now();
+        let device = MTLCreateSystemDefaultDevice().expect("this Mac has a Metal device");
+        let mut random = Random(51);
+        let mut translated = 0;
+        let mut msl_compiled = 0;
+        let mut device_compiled = 0;
+        for _ in 0..200 {
+            let length = 4 + random.below(40);
+            let mut program: Vec<u32> = (0..length)
+                .map(|_word| if random.below(5) == 0 { flow(&mut random, 0, length) } else { arithmetic(&mut random) })
+                .collect();
+            program.push(0x22 << 26);
+            let entry = random.below(4);
+            let unit = unit(&program, entry, &mut random);
+            let semantics = semantics(&mut random);
+            let Ok(glsl) = unit.translate(&semantics) else { continue };
+            translated += 1;
+            let Ok(msl) = compile_msl(&glsl) else { continue };
+            msl_compiled += 1;
+            let source = objc2_foundation::NSString::from_str(&msl);
+            if device.newLibraryWithSource_options_error(&source, None).is_ok() {
+                device_compiled += 1;
+            }
+        }
+        let elapsed = started.elapsed().as_millis();
+        println!(
+            "M0.5 metal spike: {translated} translated, {msl_compiled} MSL written,\n\
+             {device_compiled} compiled by the device in {elapsed} ms"
+        );
+        assert!(translated > 120, "the programs stopped translating");
+        assert!(msl_compiled > 100, "naga's msl writer rejected too many programs");
+        assert!(device_compiled > 80, "the device rejected too many MSL libraries");
     }
 }

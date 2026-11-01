@@ -2,7 +2,7 @@
 
 pub mod isa;
 mod batch;
-#[cfg(feature = "vulkan")]
+#[cfg(any(feature = "vulkan", feature = "metal"))]
 pub(crate) mod glsl;
 #[cfg(feature = "jit")]
 mod jit;
