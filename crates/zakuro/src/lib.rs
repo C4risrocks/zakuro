@@ -156,6 +156,17 @@ pub fn run_with(linked: Option<Linked>, overlay: Option<Box<dyn GameOverlay>>) {
         return;
     }
 
+    // the Metal backend is an M0 spike: it presents the spike's picture and
+    // not the game's screens yet, so a plain run deserves the warning
+    if matches!(app.options.renderer, Some(zakuro_gpu::RendererKind::Metal))
+        && !app.options.test_pattern
+    {
+        log::warn!(
+            "the Metal backend is an M0 spike: it only presents the spike picture; \
+             the game's screens still come from the Vulkan, OpenGL or software paths"
+        );
+    }
+
     if let Some(folder) = app.settings.games.clone() {
         app.library.scan(&folder);
     }
