@@ -457,4 +457,196 @@ mod tests {
             hardware.function(shader).expect(shader);
         }
     }
+
+    /// A3a's execution proof: one command queue draw into an off-screen
+    /// target through the whole chain the raster uses — translation, a
+    /// pipeline, vertex buffers, the encoder, commit, a GPU-side wait, and
+    /// pixels read back. The test shaders are this module's own (the PICA
+    /// fragment semantics belong to A3b's uniform wiring); the mechanism
+    /// this lands IS the landing itself.
+    #[test]
+    fn a_draw_runs_through_the_pipeline_to_pixels() {
+        use objc2_metal::{
+            MTLClearColor, MTLLoadAction, MTLRegion, MTLOrigin, MTLResourceOptions,
+            MTLStorageMode, MTLStoreAction, MTLTextureDescriptor, MTLTextureUsage,
+            MTLVertexFormat, MTLVertexStepFunction, MTLVertexDescriptor,
+            MTLRenderPipelineDescriptor, MTLDevice as _, MTLRenderCommandEncoder as _,
+            MTLCommandBuffer as _,
+        };
+        use objc2::runtime::AnyObject;
+        use std::ptr::NonNull;
+
+        // inline GLSL → the SAME translation path the rack takes
+        let (vertex_msl, vertex_entry) = glsl::compile_msl_stage_entry(
+            &tri_vertex(), ShaderStage::Vertex, &[],
+        ).expect("the test vertex shader translates");
+        let (fragment_msl, fragment_entry) = glsl::compile_msl_stage_entry(
+            &tri_fragment(), ShaderStage::Fragment, &[],
+        ).expect("the test fragment shader translates");
+
+        let hardware = HardwareMetal::new().expect("the Metal raster constructs");
+        let vertex_library = hardware.device
+            .newLibraryWithSource_options_error(&NSString::from_str(&vertex_msl), None)
+            .expect("the test vertex MSL compiles");
+        let fragment_library = hardware.device
+            .newLibraryWithSource_options_error(&NSString::from_str(&fragment_msl), None)
+            .expect("the test fragment MSL compiles");
+        let vertex_function = vertex_library.newFunctionWithName(&ns(&vertex_entry))
+            .expect("the vertex main");
+        let fragment_function = fragment_library.newFunctionWithName(&ns(&fragment_entry))
+            .expect("the fragment main");
+
+        // the pipeline: no depth attachment, the color RGBA8; the vertex
+        // slots carry the Float3 position and the Float4 color in slot 0
+        let descriptor = MTLRenderPipelineDescriptor::new();
+        descriptor.setVertexFunction(Some(vertex_function.as_ref()));
+        descriptor.setFragmentFunction(Some(fragment_function.as_ref()));
+        unsafe {
+            let attachments = descriptor.colorAttachments();
+            let color: Retained<objc2_metal::MTLRenderPipelineColorAttachmentDescriptor> =
+                attachments.objectAtIndexedSubscript(0);
+            color.setPixelFormat(MTLPixelFormat::RGBA8Unorm);
+
+            let vertex_descriptor: Retained<MTLVertexDescriptor> =
+                MTLVertexDescriptor::vertexDescriptor();
+            let attributes = vertex_descriptor.attributes();
+            let position: Retained<objc2_metal::MTLVertexAttributeDescriptor> =
+                attributes.objectAtIndexedSubscript(0);
+            position.setFormat(MTLVertexFormat::Float3);
+            position.setOffset(0);
+            position.setBufferIndex(0);
+            let painted: Retained<objc2_metal::MTLVertexAttributeDescriptor> =
+                attributes.objectAtIndexedSubscript(1);
+            painted.setFormat(MTLVertexFormat::Float4);
+            painted.setOffset(12);
+            painted.setBufferIndex(0);
+            let layouts = vertex_descriptor.layouts();
+            let layout: Retained<objc2_metal::MTLVertexBufferLayoutDescriptor> =
+                layouts.objectAtIndexedSubscript(0);
+            layout.setStride(28);
+            layout.setStepFunction(MTLVertexStepFunction::PerVertex);
+            descriptor.setVertexDescriptor(Some(&vertex_descriptor));
+        }
+        let spinner = unsafe {
+            hardware.device.newRenderPipelineStateWithDescriptor_error(&descriptor)
+        }.expect("the test pipeline constructs");
+
+        // 28 bytes a vertex, a green triangle over the presenter's navy
+        let vertices: [f32; 21] = [
+            //   x     y    z     r    g    b    a
+            -1.0, -1.0, 0.5,   0.0, 1.0, 0.0, 1.0,
+             1.0, -1.0, 0.5,   0.0, 1.0, 0.0, 1.0,
+            -1.0,  1.0, 0.5,   0.0, 1.0, 0.0, 1.0,
+        ];
+        let vertex_buffer = unsafe {
+            hardware.device.newBufferWithBytes_length_options(
+                NonNull::from(vertices.as_ref()).cast(),
+                vertices.len() * 4,
+                MTLResourceOptions::StorageModeShared,
+            )
+        }.expect("the vertex buffer allocates");
+
+        // the target texture, Managed so the CPU can read its pixels
+        const WIDTH: usize = 32;
+        const HEIGHT: usize = 32;
+        let target_descriptor = MTLTextureDescriptor::new();
+        target_descriptor.setPixelFormat(MTLPixelFormat::RGBA8Unorm);
+        unsafe {
+            target_descriptor.setWidth(WIDTH);
+            target_descriptor.setHeight(HEIGHT);
+        }
+        target_descriptor.setUsage(MTLTextureUsage::RenderTarget | MTLTextureUsage::ShaderRead);
+        target_descriptor.setStorageMode(MTLStorageMode::Managed);
+        let target = hardware.device
+            .newTextureWithDescriptor(&target_descriptor)
+            .expect("the render target allocates");
+
+        // the frame: clear to the presenter's letterbox navy, draw green
+        let pass = objc2_metal::MTLRenderPassDescriptor::new();
+        unsafe {
+            let attachments = pass.colorAttachments();
+            let attachment: Retained<objc2_metal::MTLRenderPassColorAttachmentDescriptor> =
+                attachments.objectAtIndexedSubscript(0);
+            attachment.setTexture(Some(target.as_ref()));
+            attachment.setLoadAction(MTLLoadAction::Clear);
+            attachment.setStoreAction(MTLStoreAction::Store);
+            attachment.setClearColor(MTLClearColor {
+                red: 0.04,
+                green: 0.05,
+                blue: 0.09,
+                alpha: 1.0,
+            });
+        }
+        let buffer = hardware.queue.commandBuffer().expect("the command buffer");
+        let encoder = unsafe { buffer.renderCommandEncoderWithDescriptor(&pass) }
+            .expect("the render encoder");
+        unsafe {
+            encoder.setRenderPipelineState(&spinner);
+            encoder.setVertexBuffer_offset_atIndex(Some(vertex_buffer.as_ref()), 0, 0);
+            encoder.drawPrimitives_vertexStart_vertexCount(
+                objc2_metal::MTLPrimitiveType::Triangle, 0, 3,
+            );
+            let encoder_ref: &AnyObject = encoder.as_ref();
+            let _: () = objc2::msg_send![encoder_ref, endEncoding];
+        }
+        buffer.commit();
+        buffer.waitUntilCompleted();
+
+        // read the pixels back out of the Managed target
+        let mut pixels = [0u8; WIDTH * HEIGHT * 4];
+        unsafe {
+            use objc2_metal::MTLTexture as _;
+            target.getBytes_bytesPerRow_fromRegion_mipmapLevel(
+                NonNull::from(pixels.as_mut_slice()).cast(),
+                WIDTH * 4,
+                MTLRegion {
+                    origin: MTLOrigin { x: 0, y: 0, z: 0 },
+                    size: objc2_metal::MTLSize { width: WIDTH, height: HEIGHT, depth: 1 },
+                },
+                0,
+            );
+        }
+
+        // the raster draws green in the triangle, and only there: the
+        // lower-left of the screen is green, the upper-right navy, and the
+        // diagonal the triangle's own edge.
+        let screen = |x: usize, y: usize| {
+            let at = (y * WIDTH + x) * 4;
+            [pixels[at], pixels[at + 1], pixels[at + 2], pixels[at + 3]]
+        };
+        let green = [0u8, 255, 0, 255];
+        let navy = [10u8, 13, 23, 255];
+        assert_eq!(screen(3, 28), green, "the screen's lower-left inside the triangle");
+        assert_eq!(screen(1, 2), green, "just past the top-left tip");
+        assert_eq!(screen(28, 2), navy, "the top-right is outside");
+        assert_eq!(screen(28, 28), navy, "the bottom-right is outside");
+    }
+}
+
+/// the test shaders: a triangle drawn plain, so the pixels prove the
+/// pipeline runs the raster's way (NDC positions, a flat colour out).
+fn tri_vertex() -> String {
+    String::from(r#"
+#version 450
+layout(location = 0) in vec3 position;
+layout(location = 1) in vec4 color;
+layout(location = 0) out vec4 out_color;
+void main() {
+    out_color = color;
+    gl_Position = vec4(position, 1.0);
+}
+"#
+    )
+}
+
+fn tri_fragment() -> String {
+    String::from(r#"
+#version 450
+layout(location = 0) in vec4 in_color;
+layout(location = 0) out vec4 frag_color;
+void main() {
+    frag_color = in_color;
+}
+"#
+    )
 }
