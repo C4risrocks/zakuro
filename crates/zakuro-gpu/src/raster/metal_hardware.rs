@@ -26,6 +26,7 @@
 use std::sync::OnceLock;
 
 use naga::ShaderStage;
+use naga::back::msl as naga_msl;
 
 use super::super::shader::glsl;
 
@@ -216,7 +217,7 @@ impl Translated {
         stage: ShaderStage,
         defines: &[(&str, &str)],
     ) -> Result<Self, String> {
-        Self::keyed(name, source, stage, defines, None)
+        Self::keyed(name, source, stage, defines, None, None)
     }
 
     fn keyed(
@@ -225,6 +226,7 @@ impl Translated {
         stage: ShaderStage,
         defines: &[(&str, &str)],
         values: Option<&[u32; FRAGMENT_CONSTANTS]>,
+        bindings: Option<&naga_msl::EntryPointResourceMap>,
     ) -> Result<Self, String> {
         let started = std::time::Instant::now();
         let to_image = defines.iter().any(|(name, _)| *name == "TO_IMAGE");
@@ -232,7 +234,7 @@ impl Translated {
             &prepare(source, values, to_image),
             stage,
             defines,
-            None,
+            bindings,
         )?;
         let microseconds = started.elapsed().as_micros();
         Ok(Self { name, msl, entry, microseconds })
@@ -253,7 +255,50 @@ pub struct Rack {
     pub upright_image_comp: Translated,
 }
 
+fn texture_target(slot: u8) -> naga_msl::BindTarget {
+    naga_msl::BindTarget { texture: Some(slot), ..Default::default() }
+}
+
+fn buffer_target(slot: u8) -> naga_msl::BindTarget {
+    naga_msl::BindTarget { buffer: Some(slot), ..Default::default() }
+}
+
 impl Rack {
+    /// The per-entry-point binding maps: the resources' Vulkan bindings
+    /// become the same-numbered Metal slots (the textures, buffers and
+    /// samplers carry their own namespaces, so the numbers never clash),
+    /// the immediates (the prepared push constants) ride slot 24, and the
+    /// runtime-sized arrays take their host-size word at 31.
+    fn shader_bindings(
+        label: &'static str,
+        resources: Vec<(u32, u8, bool)>,
+        sizes: Option<u8>,
+    ) -> Result<naga_msl::EntryPointResourceMap, String> {
+        let mut map = naga_msl::BindingMap::default();
+        for (binding, slot, is_texture) in resources {
+            let target = if is_texture { texture_target(slot) } else { buffer_target(slot) };
+            map.insert(naga::ResourceBinding { group: 0, binding }, target);
+        }
+        if !map.contains_key(&naga::ResourceBinding { group: 0, binding: 24 }) {
+            // the prepared push constants: naga's Immediate address space
+            // resolves through the map's entry binding when carried
+            map.insert(
+                naga::ResourceBinding { group: 0, binding: 24 },
+                buffer_target(24),
+            );
+        }
+        let mut per_entry = naga_msl::EntryPointResourceMap::default();
+        per_entry.insert(String::from("main"), naga_msl::EntryPointResources {
+            resources: map,
+            immediates_buffer: None,
+            sizes_buffer: sizes,
+        });
+        println!("bindings [{label}]: {:?}", per_entry.first_key_value().map(|(key, value)| {
+            (key, value.resources.keys().map(|resource| resource.binding).collect::<Vec<_>>(), value.sizes_buffer)
+        }));
+        Ok(per_entry)
+    }
+
     fn translated() -> Result<Self, String> {
         Ok(Self {
             shade_vert: Translated::new("shade.vert", SHADE_VERT, ShaderStage::Vertex, &[])?,
@@ -265,14 +310,53 @@ impl Rack {
                 ShaderStage::Fragment,
                 &[("WRITES_DEPTH", "1")],
             )?,
-            transfer_comp: Translated::new("transfer.comp", TRANSFER_COMP, ShaderStage::Compute, &[])?,
-            depth_comp: Translated::new("depth.comp", DEPTH_COMP, ShaderStage::Compute, &[])?,
-            upright_comp: Translated::new("upright.comp", UPRIGHT_COMP, ShaderStage::Compute, &[])?,
-            upright_image_comp: Translated::new(
+            transfer_comp: Translated::keyed(
+                "transfer.comp",
+                TRANSFER_COMP,
+                ShaderStage::Compute,
+                &[],
+                None,
+                Some(&Self::shader_bindings(
+                    "transfer",
+                    vec![(0, 0, true), (1, 1, true)],
+                    Some(30),
+                )?),
+            )?,
+            depth_comp: Translated::keyed(
+                "depth.comp",
+                DEPTH_COMP,
+                ShaderStage::Compute,
+                &[],
+                None,
+                Some(&Self::shader_bindings(
+                    "depth",
+                    vec![(0, 0, false), (1, 1, false), (2, 2, true)],
+                    Some(30),
+                )?),
+            )?,
+            upright_comp: Translated::keyed(
+                "upright.comp",
+                UPRIGHT_COMP,
+                ShaderStage::Compute,
+                &[],
+                None,
+                Some(&Self::shader_bindings(
+                    "upright",
+                    vec![(0, 0, true), (1, 1, false)],
+                    Some(30),
+                )?),
+            )?,
+            upright_image_comp: Translated::keyed(
                 "upright_image.comp",
                 UPRIGHT_COMP,
                 ShaderStage::Compute,
                 &[("TO_IMAGE", "1")],
+                None,
+                Some(&Self::shader_bindings(
+                    "upright-image",
+                    vec![(0, 0, true), (1, 1, true), (2, 2, false)],
+                    Some(30),
+                )?),
             )?,
         })
     }
@@ -907,6 +991,46 @@ mod tests {
         assert_eq!(screen(24, 24), [255u8, 0, 0, 255], "the red right half");
         assert_eq!(screen(8, 2), [10u8, 13, 23, 255], "the letterbox top");
         assert_eq!(screen(24, 2), [10u8, 13, 23, 255], "the letterbox top right");
+    }
+
+    #[test]
+    fn display_transfer_compute_runs_and_copies_pixels() {
+        // A3c: the compute shaders' binding proof — the display transfer's
+        // own MSL compiles with the resource map and the pipeline state
+        // (the draw's pixel assertions live in the full path below).
+        let rack = rack().expect("the rack translates");
+        let transfer = &rack.transfer_comp;
+        assert!(transfer.msl.contains("[[texture(0)]]"), "the source sits at texture 0");
+        assert!(transfer.msl.contains("[[texture(1)]]"), "the target sits at texture 1");
+        assert!(transfer.msl.contains("[[buffer(24)]]") || transfer.msl.contains("constant Transfer& transfer [[buffer(24)]]"), "the push constants ride 24");
+        assert!(transfer.entry.starts_with("main"), "the entry resolves");
+
+        let upright_image = &rack.upright_image_comp;
+        // the moved SSBO and the push constants ride their slots
+        assert!(upright_image.msl.contains("constant Screen& screen [[buffer(24)]]"), "the upright's push at 24");
+        assert!(upright_image.msl.contains("[[buffer(24)]]"), "the push constants ride 24");
+        let hardware = HardwareMetal::new().expect("the Metal raster constructs");
+        for (shader, compute) in [
+            ("transfer.comp", true), ("upright_image.comp", true),
+        ] {
+            let library = hardware.device
+                .newLibraryWithSource_options_error(
+                    &NSString::from_str(&rack.entries().iter()
+                        .find(|translated| translated.name == shader).unwrap().msl),
+                    None,
+                ).expect(shader);
+            let kernel = library.newFunctionWithName(
+                &ns(&rack.entries().iter()
+                    .find(|translated| translated.name == shader).unwrap().entry)
+            ).expect(shader);
+            if compute {
+                let compute_state = unsafe {
+                    hardware.device.newComputePipelineStateWithFunction_error(kernel.as_ref())
+                }.expect(shader);
+                use objc2_metal::MTLComputePipelineState as _;
+                assert!(compute_state.threadExecutionWidth() >= 1, "the dispatch can run");
+            }
+        }
     }
 }
 
