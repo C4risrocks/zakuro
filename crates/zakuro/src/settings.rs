@@ -15,6 +15,7 @@ pub enum Renderer {
     #[default]
     Vulkan,
     OpenGl,
+    #[cfg(all(feature = "metal", target_os = "macos"))]
     Metal,
 }
 

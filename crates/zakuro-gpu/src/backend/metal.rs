@@ -127,9 +127,9 @@ impl MetalPresenter {
         layer.setDevice(Some(&*device));
         layer.setPixelFormat(MTLPixelFormat::BGRA8Unorm);
         layer.setMaximumDrawableCount(3);
-        // not framebufferOnly: the screens get sampled, and so will the
-        // overlay work M2.1 picks up again
-        layer.setFramebufferOnly(false);
+        // stays framebufferOnly: CoreAnimation keeps its zero-copy present,
+        // and the pipeline samples OUR Managed textures, never the drawable
+        layer.setFramebufferOnly(true);
         layer.setDrawableSize(CGSize::new(
             (width.max(1) * scale as u32) as f64,
             (height.max(1) * scale as u32) as f64,

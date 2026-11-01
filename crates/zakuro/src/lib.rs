@@ -559,6 +559,8 @@ impl ApplicationHandler for App {
         let renderer = self.options.renderer.unwrap_or(match self.settings.renderer {
             Renderer::Vulkan => RendererKind::Vulkan,
             Renderer::OpenGl => RendererKind::OpenGl,
+            // the Metal line only when the crate was built with the backend
+            #[cfg(all(feature = "metal", target_os = "macos"))]
             Renderer::Metal => RendererKind::Metal,
         });
 
@@ -895,6 +897,7 @@ impl App {
         // the companion runs whatever the main window's backend is: Metal
         // companions own their textures, the Vulkan one shares the device
         let companion_kind = match self.backend.as_ref() {
+            #[cfg(all(feature = "metal", target_os = "macos"))]
             Some(Backend::Metal(_)) => RendererKind::Metal,
             _ => RendererKind::Vulkan,
         };
