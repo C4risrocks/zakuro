@@ -37,6 +37,8 @@ use objc2::runtime::ProtocolObject;
 #[cfg(all(target_os = "macos", feature = "metal"))]
 use objc2_foundation::NSString;
 #[cfg(all(target_os = "macos", feature = "metal"))]
+use std::ptr::NonNull;
+#[cfg(all(target_os = "macos", feature = "metal"))]
 use objc2_metal::{
     MTLCommandQueue as _, MTLCreateSystemDefaultDevice, MTLDevice as _, MTLPixelFormat,
     MTLLibrary as _, MTLRenderPipelineDescriptor, MTLVertexStepFunction,
@@ -555,10 +557,134 @@ pub struct PipelineKey {
     pub vertex: VertexStage,
 }
 
+/// A4's foundation: the batch ring the draw inputs ride in, the way the
+/// Vulkan raster's `RING_SIZE`/`RING_FLUSH`/`IN_FLIGHT` carry them. one
+/// shared MTL buffer backs the ring; a batch allocates from the head and
+/// holds its span until the GPU has run its command buffer, then the span
+/// returns to the free pool. the flush rule: when drafting a batch would
+/// walk the head past the widest live-byte span, the host flushes first —
+/// the same guarantee the Vulkan path executes through its fences.
+pub struct Ring {
+    buffer: Retained<ProtocolObject<dyn objc2_metal::MTLBuffer>>,
+    capacity: u64,
+    /// the write head, bytes from the ring's start.
+    head: u64,
+    /// the live spans, oldest first, each awaiting its command buffer's
+    /// completion: `(start, bytes)`.
+    live: std::collections::VecDeque<(u64, u64)>,
+    flushed: u64,
+}
+
+impl Ring {
+    /// a ring over a fresh Shared buffer of the capacity asked. Metal's
+    /// maxBufferLength on Apple silicon outsizes the 64 MB the Vulkan
+    /// twin asks; `capacity` stays the caller's decision.
+    pub fn new(
+        device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
+        capacity: u64,
+    ) -> Result<Self, String> {
+        use objc2_metal::{MTLBuffer as _, MTLResourceOptions};
+        let buffer = unsafe {
+            device.newBufferWithLength_options(capacity as usize, MTLResourceOptions::StorageModeShared)
+        }.ok_or("the ring's buffer did not allocate")?;
+        Ok(Self { buffer, capacity, head: 0, live: std::collections::VecDeque::new(), flushed: 0 })
+    }
+
+    /// the bytes a batch can take without the flush rule firing.
+    pub fn free(&self) -> u64 {
+        let live: u64 = self.live.iter().map(|(_, bytes)| bytes).sum();
+        self.capacity - live.min(self.capacity)
+    }
+
+    /// takes a span from the head, wrapping to the ring's start. the
+    /// caller writes the shared bytes directly; the span retires when its
+    /// command buffer completes (`retire`).
+    pub fn take(&mut self, bytes: u64) -> Result<(u64, NonNull<u8>), String> {
+        if bytes > self.free() {
+            return Err(format!(
+                "the batch's {} bytes need a flush; only {} live-free",
+                bytes, self.free()
+            ));
+        }
+        // wrap: the head's tail span must not cross the ring's end
+        let tail = self.capacity - self.head;
+        if bytes > tail {
+            // the head jumps to the start; the tail's bytes return unused
+            self.head = 0;
+        }
+        let start = self.head;
+        self.head += bytes;
+        self.live.push_back((start, bytes));
+        use objc2_metal::MTLBuffer as _;
+        let pointer = unsafe {
+            self.buffer.contents().cast::<u8>().add(start as usize)
+        };
+        Ok((start, pointer))
+    }
+
+    /// a batch's command buffer completed: its span gives back.
+    pub fn retire(&mut self, start: u64, bytes: u64) {
+        while let Some((front_start, front_bytes)) = self.live.pop_front() {
+            if front_start == start && front_bytes == bytes {
+                return;
+            }
+        }
+    }
+
+    /// the ring's buffer, for the callers writing bulk spans directly.
+    pub fn buffer_of(&self) -> &ProtocolObject<dyn objc2_metal::MTLBuffer> {
+        self.buffer.as_ref()
+    }
+
+    /// whether a flush should run before the next batch (the Vulkan
+    /// twin's RING_FLUSH: half the ring's span walked).
+    pub fn should_flush(&self) -> bool {
+        self.free() < self.capacity / 2
+    }
+}
+
 #[cfg(all(target_os = "macos", feature = "metal"))]
 mod tests {
     use super::*;
     use objc2_metal::{MTLDevice as _, MTLPixelFormat};
+
+    #[test]
+    fn the_ring_allocates_flushes_and_retires() {
+        use objc2_metal::{MTLCreateSystemDefaultDevice, MTLDevice as _};
+        let device = MTLCreateSystemDefaultDevice().expect("the device");
+        let mut ring = Ring::new(device.as_ref(), 1 << 12).expect("the ring");
+        assert_eq!(ring.free(), 1 << 12);
+        // empty ring never wants a flush
+        assert!(!ring.should_flush());
+
+        // two spans, no wrap: the head climbs
+        let (start0, pointer) = ring.take(256).expect("the span 0");
+        let (start1, _) = ring.take(512).expect("the span 1");
+        assert_eq!(start0, 0);
+        assert_eq!(start1, 256);
+        // the shared bytes' pointer sits the span's offset into the ring
+        // the pointer sits at the ring's content base (the span's start 0)
+        unsafe {
+            use objc2_metal::MTLBuffer as _;
+            let base = ring.buffer_of().contents();
+            assert_eq!(pointer.as_ptr(), base.add(0).cast::<u8>().as_ptr());
+        }
+        assert_eq!(ring.free(), (1 << 12) - 768);
+
+        // the spans retire once their command buffer completed
+        ring.retire(start0, 256);
+        ring.retire(start1, 512);
+        assert_eq!(ring.free(), 1 << 12, "everything retires back");
+
+        // a span past the tall tail wraps the head to the start
+        let (start2, _) = ring.take(3400).expect("the span wraps");
+        assert_eq!(start2, 0, "the wrapped span starts over");
+        assert!(ring.should_flush(), "half the ring walked: the flush fires");
+
+        // taking too much errors honestly
+        let too_big = ring.take((1 << 12) as u64);
+        assert!(too_big.is_err(), "the overflow refuses");
+    }
 
     #[test]
     fn pixel_formats_match_the_vulkan_twins() {
