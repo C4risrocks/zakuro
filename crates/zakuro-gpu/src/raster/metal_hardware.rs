@@ -438,6 +438,9 @@ pub fn depth_pixel_format(float_depth: bool) -> MTLPixelFormat {
     }
 }
 
+mod pica;
+pub use pica::OwnedTextureBinding;
+
 /// the hardware raster's Metal state: device, queue, and the rack's MSL
 /// libraries, one per shader's name. A2 lands this cold; A3 wires the draw
 /// execution, the ring and the display transfers through it.
@@ -454,6 +457,8 @@ pub struct HardwareMetal {
     pub(crate) ring: Ring,
     /// the draw targets backed by the guest's memory (A4).
     pub(crate) surfaces: Vec<MetalSurface>,
+    pica_textures: std::collections::HashMap<usize, pica::Texture>,
+    pica_samplers: std::collections::HashMap<super::pica_state::Filtering, Retained<ProtocolObject<dyn objc2_metal::MTLSamplerState>>>,
 }
 
 /// what a draw's vertices go through on Metal, the Vulkan twin's enum.
@@ -495,7 +500,7 @@ impl HardwareMetal {
         // first, the batch's own defines grow it honestly when A4's real
         // draws land inside
         let ring = Ring::new(device.as_ref(), 8 << 20)?;
-        Ok(Self { device, queue, libraries, entries, ring, surfaces: Vec::new() })
+        Ok(Self { device, queue, libraries, entries, ring, surfaces: Vec::new(), pica_textures: Default::default(), pica_samplers: Default::default() })
     }
 
     pub fn function(
