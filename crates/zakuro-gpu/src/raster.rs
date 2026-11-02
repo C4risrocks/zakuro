@@ -1561,6 +1561,21 @@ pub struct Resources {
     /// the host GPU, when draws go to it rather than to the software path.
     #[cfg(feature = "vulkan")]
     pub(crate) hardware: Option<hardware::Hardware>,
+    /// the Metal host, the A4's native raster when the render asks for it.
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    pub(crate) metal_hardware: Option<metal_hardware::HardwareMetal>,
+}
+
+impl Resources {
+    /// the defaults, with the Metal host set when the crate carries it.
+    pub fn with_hosts() -> Self {
+        let mut resources = Self::default();
+        #[cfg(all(feature = "metal", target_os = "macos"))]
+        {
+            resources.metal_hardware = metal_hardware::HardwareMetal::new().ok();
+        }
+        resources
+    }
 }
 
 impl Resources {
