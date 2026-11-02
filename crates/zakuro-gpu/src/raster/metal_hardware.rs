@@ -42,10 +42,14 @@ use std::ptr::NonNull;
 use objc2_metal::MTLBuffer as _;
 #[cfg(all(target_os = "macos", feature = "metal"))]
 use objc2_metal::{
-    MTLCommandQueue as _, MTLCreateSystemDefaultDevice, MTLDevice as _, MTLPixelFormat,
-    MTLLibrary as _, MTLRenderPipelineDescriptor, MTLVertexStepFunction,
-    MTLVertexFormat, MTLVertexDescriptor,
+    MTLClearColor, MTLLoadAction, MTLCommandQueue as _, MTLCreateSystemDefaultDevice,
+    MTLDevice as _, MTLPixelFormat, MTLLibrary as _, MTLRenderPassDescriptor,
+    MTLRenderPipelineDescriptor, MTLVertexStepFunction, MTLVertexFormat,
+    MTLVertexDescriptor, MTLTextureUsage, MTLStoreAction, MTLTexture as _,
+    MTLCommandBuffer as _, MTLRenderCommandEncoder as _,
 };
+#[cfg(all(target_os = "macos", feature = "metal"))]
+use objc2::runtime::AnyObject;
 const RASTER_VERT: &str = include_str!("../../shaders/raster.vert");
 const RASTER_FRAG: &str = include_str!("../../shaders/raster.frag");
 const SHADE_VERT: &str = include_str!("../../shaders/shade.vert");
@@ -417,6 +421,8 @@ pub struct HardwareMetal {
     >,
     /// the naga-mangled entry name per shader (`main` becomes `main0`…)
     entries: std::collections::HashMap<&'static str, String>,
+    /// the draw inputs' ring (A4's batch staging) — one frame at a time.
+    pub(crate) ring: Ring,
 }
 
 /// what a draw's vertices go through on Metal, the Vulkan twin's enum.
@@ -454,7 +460,11 @@ impl HardwareMetal {
             .iter()
             .map(|translated| (translated.name, translated.entry.clone()))
             .collect();
-        Ok(Self { device, queue, libraries, entries })
+        // 8 MB for the draw inputs — the Vulkan twin's 64 MB scaled down
+        // first, the batch's own defines grow it honestly when A4's real
+        // draws land inside
+        let ring = Ring::new(device.as_ref(), 8 << 20)?;
+        Ok(Self { device, queue, libraries, entries, ring })
     }
 
     pub fn function(
@@ -736,6 +746,239 @@ impl Ring {
         block.staged_at(offset);
         Ok(offset)
     }
+}
+
+/// A draw's execution on the Metal host: 24-float placed vertices packed
+/// the Vulkan raster's own way (the hardware.rs `place`'s values), the
+/// uniforms' words per draw, a real pipeline from the rack, the textures
+/// bound by slot, the target as the caller decides.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+pub struct PlacedDraw<'a> {
+    /// the vertices' 24-float rows, packed the Vulkan `place`'s way.
+    pub vertices: &'a [f32],
+    /// three indices a triangle, the draw's triangles' shape.
+    pub indices: &'a [u32],
+    /// the uniforms' words (the key's shape the DYNAMIC path counts).
+    pub uniform_words: &'a [u32],
+    /// the texture unit 0's GPU texture, when the draw samples one.
+    pub texture0: Option<&'a ProtocolObject<dyn objc2_metal::MTLTexture>>,
+    /// the render target's RGBA8 texture.
+    pub target: &'a ProtocolObject<dyn objc2_metal::MTLTexture>,
+    /// the depth+stencil twin, when the draw carries depth.
+    pub depth: Option<&'a ProtocolObject<dyn objc2_metal::MTLTexture>>,
+    /// the draw's viewport width and height (the vertices sit in them).
+    pub width: u32,
+    pub height: u32,
+}
+
+impl HardwareMetal {
+    /// A draw's execution end to end: the uniforms and the vertices staged
+    /// through the A4 ring, the pipeline built for the draw's depth shape,
+    /// the textures bound by slot, the render pass encoded, committed and
+    /// awaited. This is A4's draw executor — the app's `Resources` wire
+    /// draws into it the way `resources.hardware` carries them into
+    /// hardware.rs, and its honest remaining surface is the Vulkan twin's
+    /// full-run way (surfaces from guest memory, the display transfers'
+    /// destinations, the GPU-shading's compile race), carried the
+    /// following chapter.
+    pub fn draw_placed(
+        &mut self,
+        draw: &PlacedDraw<'_>,
+        key: &PipelineKey,
+        uniforms_words: &[u32],
+        tables_words: &[u32],
+    ) -> Result<(), String> {
+        // the ring takes the uniforms, the tables, the vertices: the
+        // Vulkan raster's batch's start
+        let mut uniforms_block = Block { words: uniforms_words.to_vec(), last: Vec::new(), at: None };
+        let uniforms_at = self.ring.stage_block(&mut uniforms_block, 16)?;
+        let mut tables_block = Block { words: tables_words.to_vec(), last: Vec::new(), at: None };
+        let tables_at = self.ring.stage_block(&mut tables_block, 16)?;
+
+        let index_bytes = (draw.indices.len() * 4) as u64;
+        let (index_at, _) = self.ring.stage(index_bytes, 4)?;
+        let staging = self.ring.span(index_at, index_bytes);
+        for (out, value) in staging.as_chunks_mut::<4>().0.iter_mut().zip(draw.indices) {
+            *out = value.to_le_bytes();
+        }
+        let vertex_bytes = (draw.vertices.len() * 4) as u64;
+        let (vertex_at, _) = self.ring.stage(vertex_bytes, 16)?;
+        let staging = self.ring.span(vertex_at, vertex_bytes);
+        for (bytes, value) in staging.as_chunks_mut::<4>().0.iter_mut().zip(draw.vertices) {
+            *bytes = value.to_le_bytes();
+        }
+
+        // the batches' route: the vertices in buffer 0, the uniforms in 3,
+        // the tables in 4, and the pipeline the draw's key builds
+        let pipeline = self.pipeline_for_key(key)?;
+
+        let pass = objc2_metal::MTLRenderPassDescriptor::new();
+        unsafe {
+            let attachments = pass.colorAttachments();
+            let colour: Retained<objc2_metal::MTLRenderPassColorAttachmentDescriptor> =
+                attachments.objectAtIndexedSubscript(0);
+            colour.setTexture(Some(draw.target));
+            colour.setLoadAction(MTLLoadAction::Clear);
+            colour.setStoreAction(MTLStoreAction::Store);
+            colour.setClearColor(MTLClearColor { red: 0.04, green: 0.05, blue: 0.09, alpha: 1.0 });
+            // the depth's twin, when the draw carries one
+            if let Some(depth) = draw.depth {
+                let depth_attachment = pass.depthAttachment();
+                depth_attachment.setTexture(Some(depth));
+                depth_attachment.setLoadAction(MTLLoadAction::Clear);
+                depth_attachment.setStoreAction(MTLStoreAction::Store);
+                depth_attachment.setClearDepth(1.0);
+            }
+        }
+        let buffer = self.queue.commandBuffer().expect("the command buffer");
+        let encoder = unsafe { buffer.renderCommandEncoderWithDescriptor(&pass) }
+            .expect("the draw's render encoder");
+        unsafe {
+            encoder.setRenderPipelineState(&pipeline);
+            encoder.setVertexBuffer_offset_atIndex(Some(self.ring.buffer_of()), vertex_at as usize, 0);
+            encoder.setFragmentBuffer_offset_atIndex(Some(self.ring.buffer_of()), uniforms_at as usize, 3);
+            encoder.setFragmentBuffer_offset_atIndex(Some(self.ring.buffer_of()), tables_at as usize, 4);
+            match draw.texture0 {
+                Some(texture) => encoder.setFragmentTexture_atIndex(Some(texture), 0),
+                None => {},
+            }
+            encoder.drawIndexedPrimitives_indexCount_indexType_indexBuffer_indexBufferOffset(
+                objc2_metal::MTLPrimitiveType::Triangle,
+                draw.indices.len(),
+                objc2_metal::MTLIndexType::UInt32,
+                self.ring.buffer_of(),
+                index_at as usize,
+            );
+            let encoder_ref: &AnyObject = encoder.as_ref();
+            let _: () = objc2::msg_send![encoder_ref, endEncoding];
+        }
+        buffer.commit();
+        buffer.waitUntilCompleted();
+        Ok(())
+    }
+
+    /// the pipeline per key: the DYNAMIC path's rack shaders, the key's
+    /// fragment words baked through `prepare`, the vertex placed or shaded.
+    fn pipeline_for_key(
+        &mut self,
+        key: &PipelineKey,
+    ) -> Result<Retained<ProtocolObject<dyn objc2_metal::MTLRenderPipelineState>>, String> {
+        use objc2_metal::{
+            MTLRenderPipelineDescriptor, MTLVertexDescriptor, MTLVertexFormat,
+            MTLVertexStepFunction, MTLTexture as _,
+        };
+        // the fragment: the KEY's words baked in through prepare, the
+        // bindings the fragment's own per-entry map
+        let mut fragment_bindings = naga_msl::BindingMap::default();
+        for binding in 0..3u32 {
+            fragment_bindings.insert(
+                naga::ResourceBinding { group: 0, binding },
+                texture_target(binding as u8),
+            );
+        }
+        fragment_bindings.insert(
+            naga::ResourceBinding { group: 0, binding: 3 },
+            buffer_target(3),
+        );
+        fragment_bindings.insert(
+            naga::ResourceBinding { group: 0, binding: 4 },
+            buffer_target(4),
+        );
+        fragment_bindings.insert(
+            naga::ResourceBinding { group: 0, binding: 24 },
+            buffer_target(24),
+        );
+        for slot in 10..13u32 {
+            fragment_bindings.insert(
+                naga::ResourceBinding { group: 0, binding: slot },
+                sampler_target(slot as u8),
+            );
+        }
+        let mut per_entry = naga_msl::EntryPointResourceMap::default();
+        per_entry.insert(String::from("main"), naga_msl::EntryPointResources {
+            resources: fragment_bindings,
+            sizes_buffer: Some(30),
+            ..Default::default()
+        });
+
+        let (fragment_msl, fragment_entry) = glsl::compile_msl_stage_entry(
+            &prepare(RASTER_FRAG, Some(&key_fragment(key)), false),
+            ShaderStage::Fragment,
+            &[],
+            Some(&per_entry),
+        )?;
+        let (vertex_msl, vertex_entry) = glsl::compile_msl_stage_entry(
+            &prepare(RASTER_VERT, None, false),
+            ShaderStage::Vertex,
+            &[],
+            None,
+        ).expect("the vertex translates");
+        let fragment_library = self.device
+            .newLibraryWithSource_options_error(&NSString::from_str(&fragment_msl), None)
+            .map_err(|error| format!("the keyed fragment MSL: {error}"))?;
+        let vertex_library = self.device
+            .newLibraryWithSource_options_error(&NSString::from_str(&vertex_msl), None)
+            .map_err(|error| format!("the vertex MSL: {error}"))?;
+        let vertex_function = vertex_library.newFunctionWithName(&ns(&vertex_entry))
+            .expect("the vertex main");
+        let fragment_function = fragment_library.newFunctionWithName(&ns(&fragment_entry))
+            .expect("the fragment main");
+
+        let descriptor = MTLRenderPipelineDescriptor::new();
+        let depth_format = if key.depth {
+            depth_pixel_format(key.float_depth)
+        } else {
+            // without depth the descriptor only needs the colour target
+            MTLPixelFormat::RGBA8Unorm
+        };
+        descriptor.setStencilAttachmentPixelFormat(depth_format);
+        descriptor.setDepthAttachmentPixelFormat(depth_format);
+        unsafe {
+            let attachments = descriptor.colorAttachments();
+            let colour: Retained<objc2_metal::MTLRenderPipelineColorAttachmentDescriptor> =
+                attachments.objectAtIndexedSubscript(0);
+            colour.setPixelFormat(MTLPixelFormat::RGBA8Unorm);
+        }
+        descriptor.setRasterSampleCount(1);
+        descriptor.setVertexFunction(Some(vertex_function.as_ref()));
+        descriptor.setFragmentFunction(Some(fragment_function.as_ref()));
+        let vertex_descriptor: Retained<MTLVertexDescriptor> =
+            MTLVertexDescriptor::vertexDescriptor();
+        unsafe {
+            let attributes = vertex_descriptor.attributes();
+            for location in 0..6 {
+                let attribute: Retained<objc2_metal::MTLVertexAttributeDescriptor> =
+                    attributes.objectAtIndexedSubscript(location);
+                attribute.setFormat(MTLVertexFormat::Float4);
+                attribute.setOffset(location * 16);
+                attribute.setBufferIndex(0);
+            }
+            let layouts = vertex_descriptor.layouts();
+            let layout: Retained<objc2_metal::MTLVertexBufferLayoutDescriptor> =
+                layouts.objectAtIndexedSubscript(0);
+            layout.setStride(96);
+            layout.setStepFunction(MTLVertexStepFunction::PerVertex);
+            descriptor.setVertexDescriptor(Some(&vertex_descriptor));
+        }
+        unsafe { self.device.newRenderPipelineStateWithDescriptor_error(&descriptor) }
+            .map_err(|error| format!("no pipeline state: {error}"))
+    }
+}
+
+fn sampler_target(slot: u8) -> naga_msl::BindTarget {
+    naga_msl::BindTarget {
+        sampler: Some(naga_msl::BindSamplerTarget::Resource(slot)),
+        ..Default::default()
+    }
+}
+
+/// the fragment words a key's shape bakes: DYNAMIC picks the generic path,
+/// the combination words ride the draw's uniforms when it is set.
+fn key_fragment(key: &PipelineKey) -> [u32; FRAGMENT_CONSTANTS] {
+    let _ = key;
+    let mut values = [0u32; FRAGMENT_CONSTANTS];
+    values[29] = 1; // DYNAMIC: the specials carry the draw's own
+    values
 }
 
 #[cfg(all(target_os = "macos", feature = "metal"))]
@@ -1221,6 +1464,107 @@ mod tests {
         }
         buffer.commit();
         buffer.waitUntilCompleted();
+
+        let mut pixels = [0u8; WIDTH * HEIGHT * 4];
+        unsafe {
+            color_target.getBytes_bytesPerRow_fromRegion_mipmapLevel(
+                NonNull::from(pixels.as_mut_slice()).cast(),
+                WIDTH * 4,
+                MTLRegion {
+                    origin: MTLOrigin { x: 0, y: 0, z: 0 },
+                    size: objc2_metal::MTLSize { width: WIDTH, height: HEIGHT, depth: 1 },
+                },
+                0,
+            );
+        }
+        let screen = |x: usize, y: usize| {
+            let at = (y * WIDTH + x) * 4;
+            [pixels[at], pixels[at + 1], pixels[at + 2], pixels[at + 3]]
+        };
+        assert_eq!(screen(8, 24), [0u8, 255, 0, 255], "the green left half");
+        assert_eq!(screen(24, 24), [255u8, 0, 0, 255], "the red right half");
+        assert_eq!(screen(8, 2), [10u8, 13, 23, 255], "the letterbox top");
+        assert_eq!(screen(24, 2), [10u8, 13, 23, 255], "the letterbox top right");
+    }
+
+    /// A4's draw executor: the uniforms and the vertices staged through
+    /// the ring's own staging, the pipeline built for the key, the draws
+    /// run indexed — the whole app-side draw path on Metal, verified by
+    /// the two halves' pixels.
+    #[test]
+    fn the_draw_executor_runs_placed_vertices() {
+        use objc2_metal::{
+            MTLRegion, MTLOrigin, MTLStorageMode, MTLTextureDescriptor, MTLTextureUsage,
+            MTLTexture as _,
+        };
+        use std::ptr::NonNull;
+
+        let mut hardware = HardwareMetal::new().expect("the Metal raster constructs");
+
+        const WIDTH: usize = 32;
+        const HEIGHT: usize = 32;
+        let color_descriptor = MTLTextureDescriptor::new();
+        color_descriptor.setPixelFormat(MTLPixelFormat::RGBA8Unorm);
+        unsafe {
+            color_descriptor.setWidth(WIDTH);
+            color_descriptor.setHeight(HEIGHT);
+        }
+        color_descriptor.setUsage(MTLTextureUsage::RenderTarget | MTLTextureUsage::ShaderRead);
+        color_descriptor.setStorageMode(MTLStorageMode::Managed);
+        let color_target = hardware.device.newTextureWithDescriptor(&color_descriptor)
+            .expect("the colour target allocates");
+        let depth_descriptor = MTLTextureDescriptor::new();
+        depth_descriptor.setPixelFormat(MTLPixelFormat::Depth32Float_Stencil8);
+        unsafe {
+            depth_descriptor.setWidth(WIDTH);
+            depth_descriptor.setHeight(HEIGHT);
+        }
+        depth_descriptor.setUsage(MTLTextureUsage::RenderTarget);
+        depth_descriptor.setStorageMode(MTLStorageMode::Managed);
+        let depth_target = hardware.device.newTextureWithDescriptor(&depth_descriptor)
+            .expect("the depth target allocates");
+
+        // the uniforms: the six pass-through stages, the words exactly as
+        // the draw's registers carry them
+        let mut uniform_words = [0u32; 376];
+        for stage in 0..6 {
+            let at = stage * 4;
+            uniform_words[at] = 0x000F_000F;
+            uniform_words[at + 2] = 0x000F_000F;
+        }
+        // the placed vertices, packed the Vulkan raster's own way
+        let vertex = |x: f32, y: f32, r: f32, g: f32, b: f32| -> [f32; 24] {
+            let mut data = [0.0f32; 24];
+            data[0] = x; data[1] = y; data[3] = 1.0;
+            data[4] = r; data[5] = g; data[6] = b; data[7] = 1.0;
+            data[14] = 0.5;
+            data
+        };
+        let mut vertices = Vec::with_capacity(24 * 6);
+        for (position, (r, g, b)) in [
+            ((-1.0f32, -1.0f32), (0.0f32, 1.0f32, 0.0f32)),
+            ((0.0f32, -1.0f32), (0.0f32, 1.0f32, 0.0f32)),
+            ((-1.0f32, 1.0f32), (0.0f32, 1.0f32, 0.0f32)),
+            ((0.0f32, -1.0f32), (1.0f32, 0.0f32, 0.0f32)),
+            ((1.0f32, -1.0f32), (1.0f32, 0.0f32, 0.0f32)),
+            ((1.0f32, 1.0f32), (1.0f32, 0.0f32, 0.0f32)),
+        ] {
+            vertices.extend(vertex(position.0, position.1, r, g, b));
+        }
+        let indices: [u32; 6] = [0, 1, 2, 3, 4, 5];
+
+        let draw = PlacedDraw {
+            vertices: &vertices,
+            indices: &indices,
+            uniform_words: &uniform_words,
+            texture0: None,
+            target: color_target.as_ref(),
+            depth: Some(depth_target.as_ref()),
+            width: WIDTH as u32,
+            height: HEIGHT as u32,
+        };
+        let key = PipelineKey { mask: 0xF, depth: true, float_depth: true, vertex: VertexStage::Placed };
+        hardware.draw_placed(&draw, &key, &uniform_words, &[]).expect("the draw runs");
 
         let mut pixels = [0u8; WIDTH * HEIGHT * 4];
         unsafe {
