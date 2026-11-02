@@ -655,6 +655,81 @@ impl Ring {
     }
 }
 
+/// A4's texture staging: the decoded texels the shared `TextureCache`
+/// hands over (the SAME decode layer the software path runs — the port
+/// costs nothing there), keyed by the texels' own identity. A texture the
+/// draw samples stays the Metal texture its texels were uploaded into
+/// until a decode hands different ones — the Vulkan raster's
+/// `textures: HashMap<usize, Texture>` by the texels' address, the same
+/// trick through objc2's Managed storage.
+#[derive(Default)]
+pub struct TexturePool {
+    textures: std::collections::HashMap<usize, PoolTexture>,
+}
+
+struct PoolTexture {
+    texture: Retained<ProtocolObject<dyn objc2_metal::MTLTexture>>,
+    width: u32,
+    height: u32,
+}
+
+impl TexturePool {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// the texture the texels sample from, uploaded once and kept until
+    /// the texels' identity changes. `key` is the texels' own address (the
+    /// cache's identity for the texture's decoded words).
+    pub fn bound(
+        &mut self,
+        device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
+        key: usize,
+        texels: &std::sync::Arc<[[u8; 4]]>,
+        width: u32,
+        height: u32,
+    ) -> Result<objc2::rc::Retained<ProtocolObject<dyn objc2_metal::MTLTexture>>, String> {
+        use objc2_metal::{MTLStorageMode, MTLTexture as _, MTLTextureDescriptor, MTLTextureUsage};
+        let expected = (width * height) as usize;
+        let staged = self.textures.get(&key)
+            .is_some_and(|pool| pool.width == width && pool.height == height);
+        if !staged {
+            let descriptor = MTLTextureDescriptor::new();
+            descriptor.setPixelFormat(MTLPixelFormat::RGBA8Unorm);
+            unsafe {
+                descriptor.setWidth(width as usize);
+                descriptor.setHeight(height as usize);
+            }
+            descriptor.setUsage(MTLTextureUsage::ShaderRead);
+            descriptor.setStorageMode(MTLStorageMode::Managed);
+            let texture = device.newTextureWithDescriptor(&descriptor)
+                .ok_or("the texture's staging did not allocate")?;
+            self.textures.insert(key, PoolTexture { texture, width, height });
+            let _ = expected;
+        }
+        let pool = self.textures.get_mut(&key).expect("the staged texture");
+        // the texels' bytes: RGBA rows, uploaded whole when they change —
+        // the same path the present's screens take (the replaceRegion's
+        // writes at the decode's rate, which the cache already deduped)
+        unsafe {
+            pool.texture.replaceRegion_mipmapLevel_withBytes_bytesPerRow(
+                objc2_metal::MTLRegion {
+                    origin: objc2_metal::MTLOrigin { x: 0, y: 0, z: 0 },
+                    size: objc2_metal::MTLSize {
+                        width: width as usize,
+                        height: height as usize,
+                        depth: 1,
+                    },
+                },
+                0,
+                std::ptr::NonNull::from(texels.as_flattened().as_ref()).cast(),
+                (width * 4) as usize,
+            );
+        }
+        Ok(pool.texture.clone())
+    }
+}
+
 /// the words a batch gathers, staged once per batch: the Vulkan twin's
 /// `Block` with the same dedupe (draws in a row mostly share the words —
 /// the host rewrites only when the words differ).
@@ -1022,6 +1097,38 @@ mod tests {
         // taking too much errors honestly
         let too_big = ring.take((1 << 12) as u64);
         assert!(too_big.is_err(), "the overflow refuses");
+    }
+
+    #[test]
+    fn texture_pool_binds_by_identity_and_uploads_the_texels() {
+        use objc2_metal::{MTLCreateSystemDefaultDevice, MTLDevice as _, MTLTexture as _};
+        use std::sync::Arc;
+        let device = MTLCreateSystemDefaultDevice().expect("the device");
+        let mut pool = TexturePool::new();
+
+        let first: Arc<[[u8; 4]]> = Arc::from(vec![[0u8, 255, 0, 255]; 4 * 4]);
+        let bound = pool.bound(device.as_ref(), 0x1000, &first, 4, 4)
+            .expect("the first texture binds");
+        assert!(bound.width() == 4, "the texture carries its width");
+
+        // the same texels' identity: the same texture object returns
+        let again = pool.bound(device.as_ref(), 0x1000, &first, 4, 4)
+            .expect("the dedupe binds");
+        assert_eq!(
+            Retained::as_ptr(&bound) as usize,
+            Retained::as_ptr(&again) as usize,
+            "the identity keeps the texture"
+        );
+
+        // a different decode: a different texture
+        let second: Arc<[[u8; 4]]> = Arc::from(vec![[255u8, 0, 0, 255]; 8 * 8]);
+        let other = pool.bound(device.as_ref(), 0x2000, &second, 8, 8)
+            .expect("the second texture binds");
+        assert_ne!(
+            Retained::as_ptr(&bound) as usize,
+            Retained::as_ptr(&other) as usize,
+            "the texels' new identity binds fresh"
+        );
     }
 
     #[test]
