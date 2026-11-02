@@ -4529,7 +4529,7 @@ mod tests {
         let texture = |height| DrawnTexture { addr: COLOR, width: 8, height, format: ColorFormat::Rgba8 };
         assert!(hardware.holds(&texture(8)));
         assert!(!hardware.holds(&texture(16)));
-        let transfer = hardware::Transfer {
+        let transfer = Transfer {
             input: COLOR,
             output: OUTPUT,
             input_width: 8,
@@ -4575,7 +4575,7 @@ mod tests {
             assert!(!hardware.holds(&texture), "the texture comes from memory");
             // the rest of the drawing comes down, and the buffer is used again
             hardware.sync(&mut memory, COLOR + 256, 256).unwrap();
-            let transfer = hardware::Transfer {
+            let transfer = Transfer {
                 input: COLOR,
                 output: OUTPUT,
                 input_width: 8,
@@ -4692,7 +4692,7 @@ mod tests {
         resources.hardware.as_mut().unwrap().filled(COLOR, &fill).unwrap();
         rasterize_shaded(&narrow, &mut memory, &mut resources, &cover(-0.5, GREEN));
         let hardware = resources.hardware.as_mut().unwrap();
-        let transfer = hardware::Transfer {
+        let transfer = Transfer {
             input: COLOR,
             output: OUTPUT,
             input_width: 16,
@@ -4873,7 +4873,7 @@ mod tests {
         let mut resources = Resources { hardware: Some(hardware), ..Default::default() };
         rasterize_shaded(&registers, &mut memory, &mut resources, &cover(-0.5, RED));
         let hardware = resources.hardware.as_mut().unwrap();
-        let transfer = |input: u32, output: u32| hardware::Transfer {
+        let transfer = |input: u32, output: u32| Transfer {
             input,
             output,
             input_width: 8,
@@ -4903,7 +4903,7 @@ mod tests {
     fn transferred(memory: &mut ConsoleMemory, resources: &mut Resources, rows: u32) -> Vec<[u8; 4]> {
         const OUTPUT: u32 = 0x10_0000;
         let hardware = resources.hardware.as_mut().unwrap();
-        let transfer = hardware::Transfer {
+        let transfer = Transfer {
             input: COLOR,
             output: OUTPUT,
             input_width: 8,
@@ -6228,7 +6228,7 @@ mod tests {
                     let input = COLOR + tile_rows * 8 * SIZE * input_format.bytes_per_pixel() as u32;
                     let input_height = SIZE - tile_rows * 8;
                     let (width, height) = (SIZE / scale_x, input_height / scale_y);
-                    let transfer = hardware::Transfer {
+                    let transfer = Transfer {
                         input,
                         output: OUTPUT,
                         input_width: SIZE,
@@ -6389,7 +6389,7 @@ mod tests {
                     let (mut gpu, mut cpu) = (drawn.clone(), drawn.clone());
                     let (scale_x, scale_y) = [(1, 1), (2, 1), (2, 2)][downscale as usize];
                     let (width, height) = (SIZE / scale_x, SIZE / scale_y);
-                    let to_linear = hardware::Transfer {
+                    let to_linear = Transfer {
                         input: COLOR,
                         output: LINEAR,
                         input_width: SIZE,
@@ -6403,7 +6403,7 @@ mod tests {
                         input_format: Rgba8,
                         output_format: linear_format,
                     };
-                    let back = hardware::Transfer {
+                    let back = Transfer {
                         input: LINEAR,
                         output: OUTPUT,
                         output_width: width,
@@ -6438,7 +6438,7 @@ mod tests {
         }
         // nothing the GPU holds there
         let hardware = resources.hardware.as_mut().unwrap();
-        let elsewhere = hardware::Transfer {
+        let elsewhere = Transfer {
             input: 0x0C_0000,
             output: OUTPUT,
             input_width: SIZE,
@@ -6454,7 +6454,7 @@ mod tests {
         };
         assert!(!hardware.display_transfer(&mut drawn.clone(), &elsewhere).unwrap());
         // an output of part of a tile is the CPU's too
-        let partial = hardware::Transfer { input: LINEAR, output_height: SIZE - 4, copy: (SIZE, SIZE - 4), ..elsewhere };
+        let partial = Transfer { input: LINEAR, output_height: SIZE - 4, copy: (SIZE, SIZE - 4), ..elsewhere };
         assert!(!hardware.display_transfer(&mut drawn.clone(), &partial).unwrap());
     }
 
@@ -6497,7 +6497,7 @@ mod tests {
             memory.write(LINEAR, &pattern);
             hardware.filled(LINEAR, &pattern).unwrap();
         };
-        let to_linear = hardware::Transfer {
+        let to_linear = Transfer {
             input: COLOR,
             output: LINEAR,
             input_width: SIZE,
@@ -6511,7 +6511,7 @@ mod tests {
             input_format: Rgba8,
             output_format: Rgb565,
         };
-        let back = hardware::Transfer { input: LINEAR, output: OUTPUT, input_linear: true, output_tiled: true, input_format: Rgb565, ..to_linear };
+        let back = Transfer { input: LINEAR, output: OUTPUT, input_linear: true, output_tiled: true, input_format: Rgb565, ..to_linear };
         fill(hardware, &mut gpu);
         assert!(hardware.display_transfer(&mut gpu, &to_linear).unwrap());
         fill(hardware, &mut gpu);
@@ -6571,7 +6571,7 @@ mod tests {
                     rasterize_shaded(&registers, &mut memory, &mut resources, &triangle);
                 }
                 let hardware = resources.hardware.as_mut().unwrap();
-                let transfer = hardware::Transfer {
+                let transfer = Transfer {
                     input: COLOR,
                     output: OUTPUT,
                     input_width: SIZE,
@@ -6635,7 +6635,7 @@ mod tests {
         registers[REG_VIEWPORT_WIDTH] = float24(SIZE as f32 / 2.0);
         registers[REG_VIEWPORT_HEIGHT] = float24(SIZE as f32 / 2.0);
         registers[REG_FRAMEBUFFER_DIMENSIONS] = SIZE | ((SIZE - 1) << 12) | 1 << 24;
-        let transfer = hardware::Transfer {
+        let transfer = Transfer {
             input: COLOR,
             output: OUTPUT,
             input_width: SIZE,
