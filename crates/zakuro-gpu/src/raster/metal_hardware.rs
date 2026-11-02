@@ -1101,6 +1101,58 @@ impl MetalSurface {
 }
 
 impl HardwareMetal {
+    /// the GPU drew into the surface: its rows come back to the guest,
+    /// re-encoded through the surface's own format (the shared `encode`,
+    /// the guest's ABGR memory order), the shadow carrying what memory
+    /// holds now — the Vulkan `store`'s shape through a Managed read-back.
+    fn write_back<M: crate::GpuMemory>(
+        &mut self,
+        memory: &mut M,
+        index: usize,
+    ) -> Result<(), String> {
+        use objc2_metal::MTLTexture as _;
+        let texture = self.surfaces[index].texture.clone();
+        let (width, height, format, tiled) = {
+            let surface = &self.surfaces[index];
+            (surface.width, surface.height, surface.format, surface.tiled)
+        };
+        let bpp = format.bytes_per_pixel();
+        // the RGBA read-back rows top-first
+        let mut rgba = vec![0u8; (width * height * 4) as usize];
+        unsafe {
+            texture.getBytes_bytesPerRow_fromRegion_mipmapLevel(
+                std::ptr::NonNull::from(rgba.as_slice()).cast(),
+                (width * 4) as usize,
+                objc2_metal::MTLRegion {
+                    origin: objc2_metal::MTLOrigin { x: 0, y: 0, z: 0 },
+                    size: objc2_metal::MTLSize {
+                        width: width as usize, height: height as usize, depth: 1,
+                    },
+                },
+                0,
+            );
+        }
+        // the guest's bytes: rows bottom-first, the pixels re-encoded
+        let mut bytes = vec![0u8; self.surfaces[index].size() as usize];
+        for y in 0..height {
+            for x in 0..width {
+                let at = (((height - 1 - y) * width + x) * 4) as usize;
+                let out = if tiled {
+                    crate::format::morton_offset(x, y, width, bpp as u32) as usize
+                } else {
+                    (y as usize * width as usize + x as usize) * bpp
+                };
+                format.encode(
+                    [rgba[at], rgba[at + 1], rgba[at + 2], rgba[at + 3]],
+                    &mut bytes[out..out + bpp],
+                );
+            }
+        }
+        memory.write(self.surfaces[index].addr, &bytes);
+        self.surfaces[index].keep(&bytes);
+        Ok(())
+    }
+
     /// looks the surface up or makes it from the guest's rows, uploading
     /// when the bytes changed — the Vulkan `surface_rows`'s shape with the
     /// CPU decode (the shared `format.decode` + morton), the upload into
@@ -1639,7 +1691,90 @@ mod tests {
         assert_eq!(screen(28, 28), navy, "the bottom-right is outside");
     }
 
-    /// A3b: the raster's real fragment semantics over the draw block — the
+    #[test]
+    fn the_write_back_carries_the_drawn_pixels_to_memory() {
+        use objc2_metal::{MTLStorageMode, MTLTextureDescriptor, MTLTextureUsage, MTLTexture as _};
+
+        let mut hardware = HardwareMetal::new().expect("the Metal raster constructs");
+        let mut memory = HostMemory::new();
+        const SIZE: u32 = 32;
+        let buffer_addr: u32 = 0x0100_0000;
+
+        // a plain surface made direct (the texture's own RGBA8): the rows
+        // empty — the draw paints green into the texture and the write-back
+        // carries it to the guest
+        let descriptor = MTLTextureDescriptor::new();
+        descriptor.setPixelFormat(MTLPixelFormat::RGBA8Unorm);
+        unsafe {
+            descriptor.setWidth(SIZE as usize);
+            descriptor.setHeight(SIZE as usize);
+        }
+        descriptor.setUsage(MTLTextureUsage::RenderTarget | MTLTextureUsage::ShaderRead);
+        descriptor.setStorageMode(MTLStorageMode::Managed);
+        let texture = hardware.device.newTextureWithDescriptor(&descriptor)
+            .expect("the surface's texture");
+        hardware.surfaces.push(MetalSurface {
+            texture,
+            addr: buffer_addr,
+            width: SIZE, height: SIZE,
+            format: ColorFormat::Rgba8,
+            tiled: false,
+            shadow: Vec::new(),
+        });
+
+        // the write-back: the empty texture encodes zeros into the guest
+        hardware.write_back(&mut memory, 0).expect("the write-back");
+        // the plain surface's bytes read linear: the pixel (5, 10)'s own
+        // words sit at ((10*32)+5)*4, the ABGR order the encode carries
+        let at = ((10 * 32 + 5) * 4) as usize;
+
+        // the draw paints a green pixel directly in the surface's texture
+        let green: [u8; 4] = [0u8, 255, 0, 255]; // memory's rgba rows stay rgba
+        unsafe {
+            use objc2_metal::MTLTexture as _;
+            let texture = &hardware.surfaces[0].texture;
+            // the texture's rows run top-first: the guest's (5, 10) sits at
+            // the texture's row (height-1-10) — the write-back's own map
+            texture.replaceRegion_mipmapLevel_withBytes_bytesPerRow(
+                objc2_metal::MTLRegion {
+                    origin: objc2_metal::MTLOrigin { x: 5, y: SIZE as usize - 1 - 10, z: 0 },
+                    size: objc2_metal::MTLSize { width: 1, height: 1, depth: 1 },
+                },
+                0,
+                std::ptr::NonNull::from(&green[..]).cast(),
+                4,
+            );
+        }
+
+        // the write-back again: the guest reads the drawn pixel back —
+        // the ABGR words: mem0 = a (255), mem2 = g (255), mem3 = r (0)
+        hardware.write_back(&mut memory, 0).expect("the write-back again");
+        let alpha = memory.read_entry_byte(buffer_addr as u64 + at as u64)
+            .expect("the guest's alpha byte");
+        assert_eq!(alpha, 255u8, "the pixel's alpha full");
+        let green_read = memory.read_entry_byte(buffer_addr as u64 + at as u64 + 2)
+            .expect("the green byte");
+        assert_eq!(green_read, 255u8, "the drawn green carried to memory");
+        let red_read = memory.read_entry_byte(buffer_addr as u64 + at as u64 + 3)
+            .expect("the red byte");
+        assert_eq!(red_read, 0u8, "the pixel's red zero");
+    }
+
+    /// HostMemory gains the byte-level reads the write-back's test needs.
+    impl HostMemory {
+        fn read_entry_byte(&self, addr: u64) -> Option<u8> {
+            // the byte lives inside a run that covers it (the write-back
+            // stores the whole surface under the surface's own base)
+            for (base, run) in &self.bytes {
+                if addr >= *base && addr < *base + run.len() as u64 {
+                    return run.get((addr - *base) as usize).copied();
+                }
+            }
+            None
+        }
+    }
+
+    /// the raster's real fragment semantics over the draw block — the
     /// DYNAMIC path reads tev/misc/units from the uniforms, the combiner
     /// stages hand the vertex colour straight through, and the resource
     /// bindings map to the Vulkan bindings' numbers (textures 0..2, the
