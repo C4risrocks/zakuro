@@ -439,7 +439,7 @@ pub fn depth_pixel_format(float_depth: bool) -> MTLPixelFormat {
 }
 
 mod pica;
-pub use pica::OwnedTextureBinding;
+pub use pica::{OwnedTextureBinding, RasterState};
 
 /// the hardware raster's Metal state: device, queue, and the rack's MSL
 /// libraries, one per shader's name. A2 lands this cold; A3 wires the draw
@@ -457,6 +457,8 @@ pub struct HardwareMetal {
     pub(crate) ring: Ring,
     /// the draw targets backed by the guest's memory (A4).
     pub(crate) surfaces: Vec<MetalSurface>,
+    pipelines: std::collections::HashMap<PipelineKey, Retained<ProtocolObject<dyn objc2_metal::MTLRenderPipelineState>>>,
+    depth_states: std::collections::HashMap<PipelineKey, Retained<ProtocolObject<dyn objc2_metal::MTLDepthStencilState>>>,
     pica_textures: std::collections::HashMap<usize, pica::Texture>,
     pica_samplers: std::collections::HashMap<super::pica_state::Filtering, Retained<ProtocolObject<dyn objc2_metal::MTLSamplerState>>>,
 }
@@ -500,7 +502,7 @@ impl HardwareMetal {
         // first, the batch's own defines grow it honestly when A4's real
         // draws land inside
         let ring = Ring::new(device.as_ref(), 8 << 20)?;
-        Ok(Self { device, queue, libraries, entries, ring, surfaces: Vec::new(), pica_textures: Default::default(), pica_samplers: Default::default() })
+        Ok(Self { device, queue, libraries, entries, ring, surfaces: Vec::new(), pipelines: Default::default(), depth_states: Default::default(), pica_textures: Default::default(), pica_samplers: Default::default() })
     }
 
     pub fn function(
@@ -571,8 +573,9 @@ impl HardwareMetal {
                 descriptor.setVertexDescriptor(Some(&vertex_descriptor));
             }
         }
-        unsafe { self.device.newRenderPipelineStateWithDescriptor_error(&descriptor) }
-            .map_err(|error| format!("no pipeline state: {error}"))
+        let pipeline = unsafe { self.device.newRenderPipelineStateWithDescriptor_error(&descriptor) }
+            .map_err(|error| format!("no pipeline state: {error}"))?;
+        Ok(pipeline)
     }
 
     /// the smaller entry point A2's test exercises: the default pipelines,
@@ -603,6 +606,16 @@ pub struct PipelineKey {
     /// the depth's D32-float twin, the way the Vulkan path falls back.
     pub float_depth: bool,
     pub vertex: VertexStage,
+    pub fragment: [u32; 30],
+    pub blend: Option<u32>,
+    pub depth_control: u32,
+    pub stencil_test: u32,
+    pub stencil_op: u32,
+}
+
+impl Default for PipelineKey {
+    fn default() -> Self { Self { mask: 15, depth: false, float_depth: true, vertex: VertexStage::Placed,
+        fragment: [0; 30], blend: None, depth_control: 0, stencil_test: 0, stencil_op: 0 } }
 }
 
 /// A4's foundation: the batch ring the draw inputs ride in, the way the
@@ -906,6 +919,22 @@ impl HardwareMetal {
         uniforms_words: &[u32],
         tables_words: &[u32],
     ) -> Result<(), String> {
+        self.draw_placed_state(draw, &RasterState { key: *key, ..RasterState::default() }, uniforms_words, tables_words)
+    }
+
+    pub fn draw_placed_state(&mut self, draw: &PlacedDraw<'_>, state: &RasterState,
+        uniforms_words: &[u32], tables_words: &[u32]) -> Result<(), String> {
+        let key = &state.key;
+
+        if draw.width == 0 || draw.height == 0 || draw.width as usize > draw.target.width() || draw.height as usize > draw.target.height() {
+            return Err("invalid Metal draw viewport".into());
+        }
+        if let Some([x,y,w,h]) = state.scissor {
+            if x.checked_add(w).is_none_or(|right| right > draw.width) || y.checked_add(h).is_none_or(|bottom| bottom > draw.height) {
+                return Err("invalid Metal draw scissor".into());
+            }
+            if w == 0 || h == 0 { return Ok(()); }
+        }
         if key.vertex != VertexStage::Placed {
             return Err("Metal placed executor cannot run interpreted vertices".into());
         }
@@ -945,6 +974,7 @@ impl HardwareMetal {
         // the batches' route: the vertices in buffer 0, the uniforms in 3,
         // the tables in 4, and the pipeline the draw's key builds
         let pipeline = self.pipeline_for_key(key)?;
+        let depth_state = self.pica_depth_state(key)?;
 
         let pass = objc2_metal::MTLRenderPassDescriptor::new();
         unsafe {
@@ -962,6 +992,11 @@ impl HardwareMetal {
                 depth_attachment.setLoadAction(if draw.clear { MTLLoadAction::Clear } else { MTLLoadAction::Load });
                 depth_attachment.setStoreAction(MTLStoreAction::Store);
                 depth_attachment.setClearDepth(1.0);
+                let stencil = pass.stencilAttachment();
+                stencil.setTexture(Some(depth));
+                stencil.setLoadAction(if draw.clear { MTLLoadAction::Clear } else { MTLLoadAction::Load });
+                stencil.setStoreAction(MTLStoreAction::Store);
+                stencil.setClearStencil(0);
             }
         }
         let buffer = self.queue.commandBuffer().expect("the command buffer");
@@ -969,6 +1004,12 @@ impl HardwareMetal {
             .expect("the draw's render encoder");
         unsafe {
             encoder.setRenderPipelineState(&pipeline);
+            encoder.setDepthStencilState(Some(&depth_state));
+            encoder.setStencilReferenceValue(state.reference);
+            let c = state.blend_color.map(|v| v as f32 / 255.0);
+            encoder.setBlendColorRed_green_blue_alpha(c[0], c[1], c[2], c[3]);
+            encoder.setViewport(objc2_metal::MTLViewport { originX: 0.0, originY: 0.0, width: draw.width as f64, height: draw.height as f64, znear: 0.0, zfar: 1.0 });
+            if let Some([x,y,w,h]) = state.scissor { encoder.setScissorRect(objc2_metal::MTLScissorRect { x: x as usize, y: y as usize, width: w as usize, height: h as usize }); }
             encoder.setVertexBuffer_offset_atIndex(Some(self.ring.buffer_of()), vertex_at as usize, 0);
             encoder.setFragmentBuffer_offset_atIndex(Some(self.ring.buffer_of()), uniforms_at as usize, 3);
             encoder.setFragmentBuffer_offset_atIndex(Some(self.ring.buffer_of()), tables_at as usize, 4);
@@ -1000,6 +1041,7 @@ impl HardwareMetal {
         &mut self,
         key: &PipelineKey,
     ) -> Result<Retained<ProtocolObject<dyn objc2_metal::MTLRenderPipelineState>>, String> {
+        if let Some(pipeline) = self.pipelines.get(key) { return Ok(pipeline.clone()); }
         use objc2_metal::{
             MTLRenderPipelineDescriptor, MTLVertexDescriptor, MTLVertexFormat,
             MTLVertexStepFunction, MTLTexture as _,
@@ -1041,7 +1083,7 @@ impl HardwareMetal {
         let (fragment_msl, fragment_entry) = glsl::compile_msl_stage_entry(
             &prepare(RASTER_FRAG, Some(&key_fragment(key)), false),
             ShaderStage::Fragment,
-            &[],
+            if key.fragment[28] & 0x100 != 0 { &[("WRITES_DEPTH", "1")][..] } else { &[] },
             Some(&per_entry),
         )?;
         let (vertex_msl, vertex_entry) = glsl::compile_msl_stage_entry(
@@ -1076,6 +1118,7 @@ impl HardwareMetal {
                 attachments.objectAtIndexedSubscript(0);
             colour.setPixelFormat(MTLPixelFormat::RGBA8Unorm);
             colour.setWriteMask(metal_color_mask(key.mask));
+            pica::configure_blend(&colour, key.blend);
         }
         descriptor.setRasterSampleCount(1);
         descriptor.setVertexFunction(Some(vertex_function.as_ref()));
@@ -1098,8 +1141,10 @@ impl HardwareMetal {
             layout.setStepFunction(MTLVertexStepFunction::PerVertex);
             descriptor.setVertexDescriptor(Some(&vertex_descriptor));
         }
-        unsafe { self.device.newRenderPipelineStateWithDescriptor_error(&descriptor) }
-            .map_err(|error| format!("no pipeline state: {error}"))
+        let pipeline = unsafe { self.device.newRenderPipelineStateWithDescriptor_error(&descriptor) }
+            .map_err(|error| format!("no pipeline state: {error}"))?;
+        self.pipelines.insert(*key, pipeline.clone());
+        Ok(pipeline)
     }
 }
 
@@ -1123,8 +1168,7 @@ fn sampler_target(slot: u8) -> naga_msl::BindTarget {
 /// the fragment words a key's shape bakes: DYNAMIC picks the generic path,
 /// the combination words ride the draw's uniforms when it is set.
 fn key_fragment(key: &PipelineKey) -> [u32; FRAGMENT_CONSTANTS] {
-    let _ = key;
-    let mut values = [0u32; FRAGMENT_CONSTANTS];
+    let mut values = key.fragment;
     values[29] = 1; // DYNAMIC: the specials carry the draw's own
     values
 }
@@ -1603,7 +1647,7 @@ mod tests {
                 .graphics_pipeline(
                     "raster.vert",
                     "raster.frag",
-                    &PipelineKey { mask: 0xF, depth, float_depth, vertex: VertexStage::Placed },
+                    &PipelineKey { mask: 0xF, depth, float_depth, vertex: VertexStage::Placed, ..PipelineKey::default() },
                 )
                 .expect("the default pipelines construct");
             let _ = pipeline;
@@ -2179,7 +2223,7 @@ mod tests {
             width: WIDTH as u32,
             height: HEIGHT as u32,
         };
-        let key = PipelineKey { mask: 0xF, depth: true, float_depth: true, vertex: VertexStage::Placed };
+        let key = PipelineKey { mask: 0xF, depth: true, float_depth: true, vertex: VertexStage::Placed, ..PipelineKey::default() };
         hardware.draw_placed(&draw, &key, &uniform_words, &[]).expect("the first draw runs");
         draw.clear = false;
         draw.indices = &indices[3..];
@@ -2216,29 +2260,29 @@ mod tests {
         assert_eq!(screen(24, 2), [10u8, 13, 23, 255], "the letterbox top right");
 
         // Exercise all three texture/sampler slots through the real fragment shader.
-        let sampler_desc = objc2_metal::MTLSamplerDescriptor::new();
-        sampler_desc.setMinFilter(objc2_metal::MTLSamplerMinMagFilter::Nearest);
-        sampler_desc.setMagFilter(objc2_metal::MTLSamplerMinMagFilter::Nearest);
-        let sampler = hardware.device.newSamplerStateWithDescriptor(&sampler_desc).unwrap();
-        let tex_desc = MTLTextureDescriptor::new();
-        tex_desc.setPixelFormat(MTLPixelFormat::RGBA8Unorm);
-        tex_desc.setStorageMode(MTLStorageMode::Managed);
-        tex_desc.setUsage(MTLTextureUsage::ShaderRead);
-        unsafe { tex_desc.setWidth(1); tex_desc.setHeight(1); }
         let colors = [[255u8, 0, 0, 255], [0, 255, 0, 255], [0, 0, 255, 255]];
-        let textures: Vec<_> = colors.iter().map(|pixel| {
-            let texture = hardware.device.newTextureWithDescriptor(&tex_desc).unwrap();
-            unsafe {
-                texture.replaceRegion_mipmapLevel_withBytes_bytesPerRow(
-                    MTLRegion { origin: MTLOrigin { x: 0, y: 0, z: 0 },
-                        size: objc2_metal::MTLSize { width: 1, height: 1, depth: 1 } },
-                    0, NonNull::from(&pixel[..]).cast(), 4);
-            }
-            texture
-        }).collect();
-        draw.textures = std::array::from_fn(|unit| Some(TextureBinding {
-            texture: textures[unit].as_ref(), sampler: sampler.as_ref(),
-        }));
+        let bound = |pixel| super::super::BoundTexture {
+            texels: std::sync::Arc::from(vec![pixel; 16*16]), drawn: None,
+            linear: false, wrap_s: super::super::Wrap::Repeat, wrap_t: super::super::Wrap::MirroredRepeat,
+            width: 16, height: 16, border: [0.0;4], replacement: None, levels: 1,
+            lod: super::super::Lod::default(),
+        };
+        let mut inputs: Vec<_> = colors.iter().map(|&color| bound(color)).collect();
+        let bindings: Vec<_> = inputs.iter().map(|input| hardware.bind_pica_texture(input).unwrap()).collect();
+        draw.textures = std::array::from_fn(|unit| Some(bindings[unit].borrowed()));
+        assert_eq!(hardware.pica_textures.len(), 3);
+        hardware.bind_pica_texture(&inputs[0]).unwrap();
+        assert_eq!(hardware.pica_textures.len(), 3, "stable Arc identity reuses uploads");
+        inputs[0].levels = 2;
+        inputs[0].texels = std::sync::Arc::from(vec![[0u8,255,0,255]; 16*16+8*8]);
+        inputs[0].lod.min = 1; inputs[0].lod.max = 1;
+        let mip = hardware.bind_pica_texture(&inputs[0]).unwrap();
+        assert_eq!(mip.borrowed().texture.mipmapLevelCount(), 2);
+        inputs[0].lod.bias = 256;
+        assert!(hardware.bind_pica_texture(&inputs[0]).is_err());
+        inputs[0].lod.bias = 0;
+        inputs[0].texels = std::sync::Arc::from(vec![[0u8;4]]);
+        assert!(hardware.bind_pica_texture(&inputs[0]).is_err());
         let mut sampled_words = [0u32; 408];
         for stage in 0..6 { sampled_words[stage * 8] = 0x000F_000F; }
         for unit in 0..3 {
@@ -2271,6 +2315,130 @@ mod tests {
                     size: objc2_metal::MTLSize { width: 1, height: 1, depth: 1 } }, 0);
         }
         assert_eq!(fog_pixel, [127, 127, 127, 255], "Draw tail and Tables size binding");
+        let read_pixel = || {
+            let mut pixel = [0u8; 4];
+            unsafe { color_target.getBytes_bytesPerRow_fromRegion_mipmapLevel(
+                NonNull::from(&mut pixel[..]).cast(), 4,
+                MTLRegion { origin: MTLOrigin { x: 24, y: 24, z: 0 },
+                size: objc2_metal::MTLSize { width: 1, height: 1, depth: 1 } }, 0); }
+            pixel
+        };
+        let pattern: std::sync::Arc<[[u8;4]]> = std::sync::Arc::from((0..256).map(|i| if i%16<8 { colors[0] } else { colors[2] }).collect::<Vec<_>>());
+        let cases = [
+            (super::super::Wrap::ClampToEdge, 0.5, false, colors[2]),
+            (super::super::Wrap::ClampToEdge, 0.5, true, [127,0,127,255]),
+            (super::super::Wrap::Repeat, 1.25, false, colors[0]),
+            (super::super::Wrap::MirroredRepeat, 1.25, false, colors[2]),
+            (super::super::Wrap::ClampToBorder, 1.25, false, colors[1]),
+        ];
+        let coordinates: Vec<Vec<f32>> = cases.iter().map(|(_,u,_,_)| {
+            let mut v = vertices.clone(); for row in v.chunks_exact_mut(24) { row[8]=*u; row[9]=0.5; } v
+        }).collect();
+        for (index,(wrap,_,linear,expected)) in cases.iter().enumerate() {
+            let mut input = bound(colors[0]); input.texels=pattern.clone(); input.wrap_s=*wrap; input.linear=*linear;
+            let binding = hardware.bind_pica_texture(&input).unwrap();
+            let textured = PlacedDraw { vertices: &coordinates[index], textures: [Some(binding.borrowed()),None,None], ..draw };
+            sampled_words[48]=0; sampled_words[0]=3|(3<<16); sampled_words[51]=1;
+            sampled_words[52]=if *wrap == super::super::Wrap::ClampToBorder { 1<<12 } else { 0 };
+            sampled_words[53]=0xFF00FF00;
+            hardware.draw_placed(&textured,&PipelineKey {mask:15,..no_writes},&sampled_words,&tables).unwrap();
+            assert_eq!(read_pixel(),*expected,"PICA sampler case {index}");
+        }
+        let mut input = bound(colors[0]); input.levels=2;
+        input.texels=std::sync::Arc::from([vec![colors[0];256],vec![colors[1];64]].concat());
+        input.lod.min=1; input.lod.max=1;
+        let binding=hardware.bind_pica_texture(&input).unwrap();
+        let mip_draw=PlacedDraw {textures:[Some(binding.borrowed()),None,None],..draw};
+        sampled_words[52]=0;
+        hardware.draw_placed(&mip_draw,&PipelineKey {mask:15,..no_writes},&sampled_words,&tables).unwrap();
+        assert_eq!(read_pixel(),colors[1],"PICA LOD clamp selects uploaded mip");
+        // Restore the fog reference used by subsequent scissor tests.
+        sampled_words[0]=5|(5<<16); sampled_words[51]=4; sampled_words[48]=5;
+        hardware.draw_placed(&draw,&PipelineKey {mask:15,..no_writes},&sampled_words,&tables).unwrap();
+        // PICA state selects constant-color blending and a scissor.
+        use crate::registers::*;
+        let mut registers = vec![0u32; 0x300];
+        registers[REG_COLOR_BUFFER_WRITE] = 1;
+        registers[REG_DEPTH_COLOR_MASK] = 0xF00;
+        registers[REG_COLOR_OPERATION] = 0x100;
+        registers[REG_BLEND_FUNC] = (10 << 16) | (1 << 24);
+        registers[0x103] = 0xFF000040;
+        let mut state = RasterState::from_pica(&registers, false, false, false, false).unwrap();
+        sampled_words[48] = 0; sampled_words[51] = 0; sampled_words[0] = 0;
+        state.scissor = Some([0,0,16,32]);
+        hardware.draw_placed_state(&draw, &state, &sampled_words, &tables).unwrap();
+        assert_eq!(read_pixel(), [127,127,127,255], "scissor excludes this pixel");
+        state.scissor = Some([16,0,16,32]);
+        hardware.draw_placed_state(&draw, &state, &sampled_words, &tables).unwrap();
+        assert_eq!(read_pixel(), [64,0,0,255], "PICA constant blend factor");
+        let pipeline_count = hardware.pipelines.len();
+        let depth_count = hardware.depth_states.len();
+        hardware.draw_placed_state(&draw, &state, &sampled_words, &tables).unwrap();
+        assert_eq!(hardware.pipelines.len(), pipeline_count, "PSO cache hit");
+        assert_eq!(hardware.depth_states.len(), depth_count, "depth/stencil cache hit");
+        // Depth starts at 1.0. Greater rejects z=0.5; Less accepts it.
+        draw.depth = Some(depth_target.as_ref());
+        registers[REG_COLOR_OPERATION] = 0; registers[REG_LOGIC_OP] = 3;
+        registers[REG_DEPTH_COLOR_MASK] = 0xF00 | 1 | (6 << 4);
+        let rejected = RasterState::from_pica(&registers, true, false, false, false).unwrap();
+        hardware.draw_placed_state(&draw, &rejected, &sampled_words, &tables).unwrap();
+        assert_eq!(read_pixel(), [64,0,0,255], "depth Greater rejects");
+        registers[REG_DEPTH_COLOR_MASK] = 0xF00 | 1 | (4 << 4);
+        let accepted = RasterState::from_pica(&registers, true, false, false, false).unwrap();
+        hardware.draw_placed_state(&draw, &accepted, &sampled_words, &tables).unwrap();
+        assert_eq!(read_pixel(), [255,0,0,255], "depth Less accepts");
+        // Stencil Equal against initial zero rejects a reference of one.
+        registers[REG_DEPTH_BUFFER_FORMAT] = 3;
+        registers[REG_STENCIL_TEST] = 1 | (2 << 4) | (1 << 16) | (255 << 24);
+        let stencil_reject = RasterState::from_pica(&registers, true, false, false, false).unwrap();
+        sampled_words[0] = 5 | (5 << 16); sampled_words[51] = 4;
+        hardware.draw_placed_state(&draw, &stencil_reject, &sampled_words, &tables).unwrap();
+        assert_eq!(read_pixel(), [255,0,0,255], "stencil Equal rejects");
+        registers[REG_STENCIL_TEST] &= !(255 << 16);
+        let stencil_accept = RasterState::from_pica(&registers, true, false, false, false).unwrap();
+        hardware.draw_placed_state(&draw, &stencil_accept, &sampled_words, &tables).unwrap();
+        assert_eq!(read_pixel(), [0,0,255,255], "stencil Equal accepts zero");
+        sampled_words[0]=0; sampled_words[51]=0;
+        registers[REG_DEPTH_STENCIL_WRITE]=1;
+        registers[REG_STENCIL_TEST]=1|(1<<4)|(255<<8)|(2<<16)|(255<<24);
+        registers[REG_STENCIL_OP]=2<<8;
+        let replace=RasterState::from_pica(&registers,true,false,false,false).unwrap();
+        hardware.draw_placed_state(&draw,&replace,&sampled_words,&tables).unwrap();
+        assert_eq!(read_pixel(),colors[0],"stencil Replace writes reference 2");
+        registers[REG_STENCIL_TEST]=1|(2<<4)|(2<<16)|(255<<24);
+        registers[REG_STENCIL_OP]=0;
+        sampled_words[0]=5|(5<<16); sampled_words[51]=4;
+        let replaced=RasterState::from_pica(&registers,true,false,false,false).unwrap();
+        hardware.draw_placed_state(&draw,&replaced,&sampled_words,&tables).unwrap();
+        assert_eq!(read_pixel(),colors[2],"stencil Equal reads back replaced value");
+        draw.depth = None;
+        registers[REG_LOGIC_OP] = 3;
+        sampled_words[0] = 1 | (1<<16); sampled_words[51]=0;
+        sampled_words[104]=1.0f32.to_bits(); sampled_words[105]=0; sampled_words[106]=0;
+        let lit = RasterState::from_pica(&registers,false,true,false,false).unwrap();
+        hardware.draw_placed_state(&draw,&lit,&sampled_words,&tables).unwrap();
+        assert_eq!(read_pixel(),colors[0],"fragment lighting specialization uses global ambient");
+        sampled_words[0]=6|(6<<16);
+        tables[13056]=0; tables[13057]=255.0f32.to_bits(); tables[13058]=0; tables[13059]=255.0f32.to_bits();
+        let procedural = RasterState::from_pica(&registers,false,false,true,false).unwrap();
+        hardware.draw_placed_state(&draw,&procedural,&sampled_words,&tables).unwrap();
+        assert_eq!(read_pixel(),colors[1],"procedural specialization samples color LUT");
+        sampled_words[0]=3|(3<<16); sampled_words[51]=1;
+        sampled_words[50]=1; // alpha Never
+        hardware.draw_placed_state(&draw,&procedural,&sampled_words,&tables).unwrap();
+        assert_eq!(read_pixel(),colors[1],"alpha rejection preserves target");
+        sampled_words[50]=0; sampled_words[0]=0; sampled_words[51]=0; sampled_words[64]=1;
+        let mut wb_vertices=vertices.clone();
+        for row in wb_vertices.chunks_exact_mut(24) { row[0]*=2.0; row[1]*=2.0; row[3]=2.0; }
+        let wb_draw=PlacedDraw {vertices:&wb_vertices,depth:Some(depth_target.as_ref()),..draw};
+        registers[REG_STENCIL_TEST]=0; registers[REG_STENCIL_OP]=0;
+        let wb_state=RasterState::from_pica(&registers,true,false,false,true).unwrap();
+        hardware.draw_placed_state(&wb_draw,&wb_state,&sampled_words,&tables).unwrap();
+        assert_eq!(read_pixel(),colors[1],"fragment w-depth 1.0 fails Less against clear depth 1.0");
+        registers[REG_LOGIC_OP] = 11;
+        assert!(RasterState::from_pica(&registers, true, false, false, false).is_err());
+        draw.depth = None;
+        sampled_words[51]=4;
         draw.textures[2] = None;
         assert!(hardware.draw_placed(&draw, &no_writes, &sampled_words, &[]).is_err());
         assert!(hardware.draw_placed(&draw, &no_writes, &[], &[]).is_err());
