@@ -444,7 +444,7 @@ impl Gpu {
         // what the host GPU drew it transfers itself, keeping the output
         #[cfg(feature = "vulkan")]
         if let Some(hardware) = self.resources.hardware.as_mut() {
-            let transfer = raster::hardware::Transfer {
+            let transfer = raster::Transfer {
                 input: input_base,
                 output: output_base,
                 input_width,

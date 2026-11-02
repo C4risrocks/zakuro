@@ -756,23 +756,6 @@ struct Frame {
     pending: Option<u64>,
 }
 
-/// a display transfer's registers, taken apart.
-pub(crate) struct Transfer {
-    pub(crate) input: u32,
-    pub(crate) output: u32,
-    pub(crate) input_width: u32,
-    pub(crate) output_width: u32,
-    pub(crate) output_height: u32,
-    /// the pixels written, width and height.
-    pub(crate) copy: (u32, u32),
-    /// the input pixels averaged into each output pixel, across and down.
-    pub(crate) scale: (u32, u32),
-    pub(crate) flip: bool,
-    pub(crate) input_linear: bool,
-    pub(crate) output_tiled: bool,
-    pub(crate) input_format: ColorFormat,
-    pub(crate) output_format: ColorFormat,
-}
 
 /// a compute pipeline, the shader and what it takes.
 struct Compute {
@@ -4087,7 +4070,7 @@ impl Hardware {
     /// anything else, for the CPU to do. the output stays on the GPU, and a
     /// copy of it heads for the host in the same batch, which goes to the
     /// GPU right away without waiting for it.
-    pub(crate) fn display_transfer<M: GpuMemory>(&mut self, memory: &mut M, transfer: &Transfer) -> Result<bool, String> {
+    pub(crate) fn display_transfer<M: GpuMemory>(&mut self, memory: &mut M, transfer: &super::Transfer) -> Result<bool, String> {
         let t = transfer;
         let input_kind = Kind::Color(t.input_format);
         let output_kind = Kind::Color(t.output_format);

@@ -1165,7 +1165,11 @@ impl HardwareMetal {
             let (w_us, h_us, bpp_us) = (w as usize, h as usize, bpp as usize);
             for y in 0..h {
                 for x in 0..w {
-                    let at = crate::format::morton_offset(x, y, w, bpp) as usize;
+                    let at = if texture.tiled {
+                        crate::format::morton_offset(x, y, w, bpp) as usize
+                    } else {
+                        ((y * w + x) * bpp) as usize
+                    };
                     let rgba: [u8; 4] = decode.decode(&bytes[at..at + bpp_us]);
                     let out = ((h_us - 1 - y as usize) * w_us + x as usize) * 4;
                     texture_bytes[out..out + 4].copy_from_slice(&rgba);
@@ -1186,6 +1190,101 @@ impl HardwareMetal {
             self.surfaces[index].keep(&bytes);
         }
         Ok(index)
+    }
+}
+
+/// the display-transfer's run on the Metal host: the input surface loads
+/// from the guest (the check_surface's honest load), the output surface
+/// mounts, and the transfer's compute shader averages the game's pixels
+/// through their own formats. the push constants carry the shader's words:
+/// size, input height, output height, scale, flip, and the two formats.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+impl HardwareMetal {
+    pub(crate) fn display_transfer<M: crate::GpuMemory>(
+        &mut self,
+        memory: &mut M,
+        transfer: &super::Transfer,
+    ) -> Result<(), String> {
+        use objc2_metal::{MTLCommandBuffer as _, MTLComputeCommandEncoder as _, MTLTexture as _};
+        use objc2::runtime::AnyObject;
+
+        // the input surface from the guest: its own height carries the
+        // rows the scale reads (the transfer's blocks read size.y * scale.y)
+        let input_height = transfer.copy.1 * transfer.scale.1;
+        let input_index = self.check_surface(
+            memory,
+            transfer.input,
+            (transfer.input_width, input_height),
+            transfer.input_format,
+            !transfer.input_linear,
+        )?;
+        let input = self.surfaces[input_index].texture.clone();
+
+        // the output surface: the target's size at the output's format —
+        // the output's tiles are plain rows if the transfer leaves them so
+        let output_index = self.check_surface(
+            memory,
+            transfer.output,
+            (transfer.output_width, transfer.output_height),
+            transfer.output_format,
+            transfer.output_tiled,
+        )?;
+
+        // the compute: once per the rack's translation
+        let rack = rack()?;
+        let compute_library = self.device
+            .newLibraryWithSource_options_error(&NSString::from_str(&rack.transfer_comp.msl), None)
+            .map_err(|error| format!("the transfer's MSL: {error}"))?;
+        let kernel = compute_library.newFunctionWithName(&ns(&rack.transfer_comp.entry))
+            .expect("the transfer main");
+        let compute = unsafe {
+            self.device.newComputePipelineStateWithFunction_error(kernel.as_ref())
+        }.map_err(|error| format!("the transfer compute pipeline: {error}"))?;
+
+        // the push constants: the shader's words in the GLSL block's order
+        // — the honest surfaces run at the console's resolution (scale 1)
+        let mut push = [0u32; 11];
+        push[0] = transfer.copy.0;                 // size.x: the output's width
+        push[1] = transfer.copy.1;                 // size.y
+        push[2] = input_height;                    // the input's own height
+        push[3] = transfer.output_height;          // the output's height
+        push[4] = transfer.scale.0;
+        push[5] = transfer.scale.1;
+        push[6] = transfer.flip as u32;
+        push[7] = transfer.input_format as u32;
+        push[8] = transfer.output_format as u32;
+        push[9] = 0;                               // the input starts at its row 0
+        push[10] = input_height;
+        let push_buffer = unsafe {
+            self.device.newBufferWithBytes_length_options(
+                std::ptr::NonNull::from(push.as_ref()).cast(),
+                push.len() * 4,
+                objc2_metal::MTLResourceOptions::StorageModeShared,
+            )
+        }.expect("the transfer's push buffer");
+
+        let buffer = self.queue.commandBuffer().expect("the command buffer");
+        let encoder = unsafe { buffer.computeCommandEncoder() }.expect("the compute encoder");
+        unsafe {
+            encoder.setComputePipelineState(&compute);
+            // the input's image is the surface's own texture at slot 0
+            encoder.setTexture_atIndex(Some(input.as_ref()), 0);
+            let output = self.surfaces[output_index].texture.clone();
+            encoder.setTexture_atIndex(Some(output.as_ref()), 1);
+            encoder.setBuffer_offset_atIndex(Some(push_buffer.as_ref()), 0, 24);
+            let threads = objc2_metal::MTLSize {
+                width: transfer.copy.0 as usize, height: transfer.copy.1 as usize, depth: 1,
+            };
+            let group = objc2_metal::MTLSize {
+                width: 1, height: 1, depth: 1,
+            };
+            encoder.dispatchThreadgroups_threadsPerThreadgroup(group, threads);
+            let encoder_ref: &AnyObject = encoder.as_ref();
+            let _: () = objc2::msg_send![encoder_ref, endEncoding];
+        }
+        buffer.commit();
+        buffer.waitUntilCompleted();
+        Ok(())
     }
 }
 
@@ -1885,6 +1984,64 @@ mod tests {
         assert_eq!(screen(24, 24), [255u8, 0, 0, 255], "the red right half");
         assert_eq!(screen(8, 2), [10u8, 13, 23, 255], "the letterbox top");
         assert_eq!(screen(24, 2), [10u8, 13, 23, 255], "the letterbox top right");
+    }
+
+    #[test]
+    fn the_display_transfer_executor_runs_the_guest_ramp() {
+        use objc2_metal::MTLTexture as _;
+
+        let mut hardware = HardwareMetal::new().expect("the Metal raster constructs");
+        let mut memory = HostMemory::new();
+
+        // the input: 16x16 grey ramp (the pixel (x, y) carries x)
+        let input_addr = 0x0100_0000u32;
+        let mut bytes = vec![0u8; (16 * 16 * 4) as usize];
+        for (index, pixel) in bytes.chunks_exact_mut(4).enumerate() {
+            let x = (index % 16) as u8;
+            pixel.copy_from_slice(&[255u8, x, x, x]);
+        }
+        memory.write_raw(input_addr as u64, &bytes);
+
+        let transfer = crate::raster::Transfer {
+            input: input_addr, output: input_addr + 16 * 16 * 4,
+            input_width: 16, output_width: 8, output_height: 8,
+            copy: (8, 8), scale: (2, 2),
+            flip: false, input_linear: true, output_tiled: false,
+            input_format: ColorFormat::Rgba8, output_format: ColorFormat::Rgba8,
+        };
+        hardware.display_transfer(&mut memory, &transfer).expect("the transfer runs");
+
+        // two surfaces over the run: the input's at index 0 with its shadow,
+        // the output's at 1 (the transfer's own writes carried the texture)
+        assert_eq!(hardware.surfaces.len(), 2, "the in and the out");
+
+        // the output's pixels read back the honest averaged shape
+        let output = &hardware.surfaces[1];
+        let mut pixels = [0u8; 8 * 8 * 4];
+        unsafe {
+            output.texture.getBytes_bytesPerRow_fromRegion_mipmapLevel(
+                std::ptr::NonNull::from(pixels.as_mut_slice()).cast(),
+                32,
+                objc2_metal::MTLRegion {
+                    origin: objc2_metal::MTLOrigin { x: 0, y: 0, z: 0 },
+                    size: objc2_metal::MTLSize { width: 8 as usize, height: 8 as usize, depth: 1 },
+                },
+                0,
+            );
+        }
+        let screen = |x: usize, y: usize| {
+            let at = (y * 8 + x) * 4;
+            [pixels[at], pixels[at + 1], pixels[at + 2], pixels[at + 3]]
+        };
+        // the debug: the whole read-back's red bytes ROW-MAJOR
+        for y in 0..8u8 {
+            println!("row {y}: {:?}", (0..8usize).map(|x| screen(x as usize, y as usize)[0]).collect::<Vec<_>>());
+        }
+        assert_eq!(screen(0, 0)[0], 1, "the average of columns 0 and 1");
+        assert_eq!(screen(7, 0)[0], 15, "the average of the ramp's last columns");
+        assert_eq!(screen(0, 7)[0], 1, "the bottom rows' own average");
+        assert_eq!(screen(4, 4)[0], 9, "the average of 8 and 9 past (34+2)/4");
+        assert_eq!(pixels[3], 255, "the alpha stays full");
     }
 
     #[test]

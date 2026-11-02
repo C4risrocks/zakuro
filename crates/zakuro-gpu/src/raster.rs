@@ -13,6 +13,25 @@ use crate::lighting::{Lighting, Tables};
 pub(crate) mod hardware;
 #[cfg(all(feature = "metal", target_os = "macos"))]
 pub mod metal_hardware;
+
+/// a display transfer's registers, taken apart.
+#[derive(Clone, Copy)]
+pub(crate) struct Transfer {
+    pub(crate) input: u32,
+    pub(crate) output: u32,
+    pub(crate) input_width: u32,
+    pub(crate) output_width: u32,
+    pub(crate) output_height: u32,
+    /// the pixels written, width and height.
+    pub(crate) copy: (u32, u32),
+    /// the input pixels averaged into each output pixel, across and down.
+    pub(crate) scale: (u32, u32),
+    pub(crate) flip: bool,
+    pub(crate) input_linear: bool,
+    pub(crate) output_tiled: bool,
+    pub(crate) input_format: ColorFormat,
+    pub(crate) output_format: ColorFormat,
+}
 use crate::texture::TextureFormat;
 use crate::shader::{self, ShaderUnit, Vec4};
 use crate::{format::ColorFormat, GpuMemory};
