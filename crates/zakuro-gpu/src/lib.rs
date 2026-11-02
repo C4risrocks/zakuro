@@ -345,6 +345,11 @@ impl Gpu {
             }
         }
 
+        #[cfg(all(feature = "metal", target_os = "macos"))]
+        if let Some(metal) = self.resources.metal_hardware.as_mut() {
+            metal.sync_guest(address, length as u32);
+            self.resources.textures.invalidate_range(address, length as u32);
+        }
         let bytes = value.to_le_bytes();
         let pattern = &bytes[..if matches!(width, 2 | 3) { width as usize } else { 4 }];
         log::debug!(
@@ -835,6 +840,11 @@ impl Gpu {
     /// makes guest memory right over a range something other than a draw
     /// is about to read or write, the host GPU keeps what it draws until then.
     pub fn sync_memory<M: GpuMemory>(&mut self, memory: &mut M, addr: u32, len: u32) {
+        #[cfg(all(feature = "metal", target_os = "macos"))]
+        if let Some(metal) = self.resources.metal_hardware.as_mut() {
+            metal.sync_guest(addr, len);
+            self.resources.textures.invalidate_range(addr, len);
+        }
         #[cfg(feature = "vulkan")]
         if let Some(hardware) = self.resources.hardware.as_mut() {
             if let Err(error) = hardware.sync(memory, addr, len) {
@@ -849,6 +859,11 @@ impl Gpu {
     /// over a range, for the CPU reading there. the CPU reads color buffers
     /// as memory holds them.
     pub fn sync_depth<M: GpuMemory>(&mut self, memory: &mut M, addr: u32, len: u32) {
+        #[cfg(all(feature = "metal", target_os = "macos"))]
+        if let Some(metal) = self.resources.metal_hardware.as_mut() {
+            metal.sync_guest(addr, len);
+            self.resources.textures.invalidate_range(addr, len);
+        }
         #[cfg(feature = "vulkan")]
         if let Some(hardware) = self.resources.hardware.as_mut() {
             if let Err(error) = hardware.sync_depth(memory, addr, len) {

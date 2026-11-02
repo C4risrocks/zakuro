@@ -439,6 +439,8 @@ pub fn depth_pixel_format(float_depth: bool) -> MTLPixelFormat {
 }
 
 mod pica;
+mod coherence;
+pub use coherence::{GuestTarget, GuestDepth, GuestDraw, CoherenceError};
 pub use pica::{OwnedTextureBinding, RasterState};
 
 /// the hardware raster's Metal state: device, queue, and the rack's MSL
@@ -459,6 +461,7 @@ pub struct HardwareMetal {
     pub(crate) surfaces: Vec<MetalSurface>,
     pipelines: std::collections::HashMap<PipelineKey, Retained<ProtocolObject<dyn objc2_metal::MTLRenderPipelineState>>>,
     depth_states: std::collections::HashMap<PipelineKey, Retained<ProtocolObject<dyn objc2_metal::MTLDepthStencilState>>>,
+    failed: bool,
     pica_textures: std::collections::HashMap<usize, pica::Texture>,
     pica_samplers: std::collections::HashMap<super::pica_state::Filtering, Retained<ProtocolObject<dyn objc2_metal::MTLSamplerState>>>,
 }
@@ -502,7 +505,7 @@ impl HardwareMetal {
         // first, the batch's own defines grow it honestly when A4's real
         // draws land inside
         let ring = Ring::new(device.as_ref(), 8 << 20)?;
-        Ok(Self { device, queue, libraries, entries, ring, surfaces: Vec::new(), pipelines: Default::default(), depth_states: Default::default(), pica_textures: Default::default(), pica_samplers: Default::default() })
+        Ok(Self { device, queue, libraries, entries, ring, surfaces: Vec::new(), pipelines: Default::default(), depth_states: Default::default(), failed: false, pica_textures: Default::default(), pica_samplers: Default::default() })
     }
 
     pub fn function(
@@ -837,7 +840,8 @@ impl Ring {
 
     /// the write window for a staged span, the twin of hardware.rs's
     /// `ring(offset, size)`.
-    pub fn span(&self, start: u64, size: u64) -> &mut [u8] {
+    pub fn span(&mut self, start: u64, size: u64) -> &mut [u8] {
+        assert!(start.checked_add(size).is_some_and(|end| end <= self.capacity), "ring span outside buffer");
         // SAFETY: the ring is Shared-mapped for its whole size and stage
         // kept the range inside it; the GPU is not reading this batch's
         // span while it is being recorded (A3b's one-frame channel says
@@ -925,6 +929,8 @@ impl HardwareMetal {
     pub fn draw_placed_state(&mut self, draw: &PlacedDraw<'_>, state: &RasterState,
         uniforms_words: &[u32], tables_words: &[u32]) -> Result<(), String> {
         let key = &state.key;
+        if self.failed { return Err("Metal backend failed; recreate before drawing".into()); }
+
 
         if draw.width == 0 || draw.height == 0 || draw.width as usize > draw.target.width() || draw.height as usize > draw.target.height() {
             return Err("invalid Metal draw viewport".into());
@@ -951,6 +957,9 @@ impl HardwareMetal {
         }
         let table_bytes = u32::try_from(tables_words.len() * 4)
             .map_err(|_| "Metal Tables buffer is too large")?;
+        // This executor waits for every submission. All previous spans are retired.
+        self.ring.head = 0;
+        self.ring.live.clear();
         // the ring takes the uniforms, the tables, the vertices: the
         // Vulkan raster's batch's start
         let mut uniforms_block = Block { words: uniforms_words.to_vec(), last: Vec::new(), at: None };
@@ -1032,6 +1041,12 @@ impl HardwareMetal {
         }
         buffer.commit();
         buffer.waitUntilCompleted();
+        self.ring.head = 0;
+        self.ring.live.clear();
+        if buffer.status() != objc2_metal::MTLCommandBufferStatus::Completed {
+            self.failed = true;
+            return Err("Metal draw execution failed; guest memory was not committed".into());
+        }
         Ok(())
     }
 
@@ -1230,12 +1245,18 @@ impl HardwareMetal {
             let surface = &self.surfaces[index];
             (surface.width, surface.height, surface.format, surface.tiled)
         };
+        let command=self.queue.commandBuffer().ok_or("Metal readback command allocation")?;
+        let encoder=command.blitCommandEncoder().ok_or("Metal readback encoder allocation")?;
+        unsafe { use objc2_metal::MTLBlitCommandEncoder as _; encoder.synchronizeResource((*texture).as_ref()); }
+        { use objc2_metal::MTLCommandEncoder as _; encoder.endEncoding(); }
+        command.commit(); command.waitUntilCompleted();
+        if command.status()!=objc2_metal::MTLCommandBufferStatus::Completed { self.failed=true; return Err("Metal readback failed".into()); }
         let bpp = format.bytes_per_pixel();
         // the RGBA read-back rows top-first
         let mut rgba = vec![0u8; (width * height * 4) as usize];
         unsafe {
             texture.getBytes_bytesPerRow_fromRegion_mipmapLevel(
-                std::ptr::NonNull::from(rgba.as_slice()).cast(),
+                std::ptr::NonNull::from(rgba.as_mut_slice()).cast(),
                 (width * 4) as usize,
                 objc2_metal::MTLRegion {
                     origin: objc2_metal::MTLOrigin { x: 0, y: 0, z: 0 },
@@ -1280,6 +1301,9 @@ impl HardwareMetal {
         tiled: bool,
     ) -> Result<usize, String> {
         use objc2_metal::{MTLStorageMode, MTLTextureDescriptor, MTLTextureUsage};
+        coherence::validate_surface(addr, width, height, format.bytes_per_pixel() as u32, tiled)
+            .map_err(|e| e.to_string())?;
+
         let index = self
             .surfaces
             .iter()
@@ -1374,6 +1398,19 @@ impl HardwareMetal {
         use objc2_metal::{MTLCommandBuffer as _, MTLComputeCommandEncoder as _, MTLTexture as _};
         use objc2::runtime::AnyObject;
 
+        if !matches!(transfer.scale.0,1|2) || !matches!(transfer.scale.1,1|2) { return Err("unsupported Metal transfer scale".into()); }
+        if transfer.copy.0 == 0 || transfer.copy.1 == 0 { return Ok(()); }
+        if self.failed { return Err("Metal backend failed".into()); }
+        let input_height = transfer.copy.1.checked_mul(transfer.scale.1).ok_or("transfer dimensions overflow")?;
+        let input_len = coherence::validate_surface(transfer.input, transfer.input_width, input_height, transfer.input_format.bytes_per_pixel() as u32, !transfer.input_linear).map_err(|e| e.to_string())?;
+        let output_len = coherence::validate_surface(transfer.output, transfer.output_width, transfer.output_height, transfer.output_format.bytes_per_pixel() as u32, transfer.output_tiled).map_err(|e| e.to_string())?;
+        if transfer.copy.0.checked_mul(transfer.scale.0).is_none_or(|n| n > transfer.input_width)
+            || transfer.copy.0 > transfer.output_width || transfer.copy.1 > transfer.output_height {
+            return Err("invalid Metal transfer rectangle".into());
+        }
+        if coherence::overlaps(transfer.input, input_len, transfer.output, output_len) {
+            return Err("unsupported overlapping Metal transfer; use coherent CPU transfer".into());
+        }
         // the input surface from the guest: its own height carries the
         // rows the scale reads (the transfer's blocks read size.y * scale.y)
         let input_height = transfer.copy.1 * transfer.scale.1;
@@ -1441,15 +1478,17 @@ impl HardwareMetal {
             let threads = objc2_metal::MTLSize {
                 width: transfer.copy.0 as usize, height: transfer.copy.1 as usize, depth: 1,
             };
-            let group = objc2_metal::MTLSize {
-                width: 1, height: 1, depth: 1,
-            };
-            encoder.dispatchThreadgroups_threadsPerThreadgroup(group, threads);
+            encoder.dispatchThreads_threadsPerThreadgroup(threads, objc2_metal::MTLSize { width: 8, height: 8, depth: 1 });
             let encoder_ref: &AnyObject = encoder.as_ref();
             let _: () = objc2::msg_send![encoder_ref, endEncoding];
         }
         buffer.commit();
         buffer.waitUntilCompleted();
+        if buffer.status() != objc2_metal::MTLCommandBufferStatus::Completed {
+            self.failed = true;
+            return Err("Metal transfer execution failed".into());
+        }
+        self.write_back(memory, output_index)?;
         Ok(())
     }
 }

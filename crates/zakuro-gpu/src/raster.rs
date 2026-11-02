@@ -1595,6 +1595,11 @@ impl Resources {
     /// saved state had it.
     pub(crate) fn forget(&mut self) {
         self.textures.forget();
+        #[cfg(all(feature = "metal", target_os = "macos"))]
+        if let Some(metal) = self.metal_hardware.as_mut() {
+            metal.forget_guest();
+        }
+
         self.tex_env = Default::default();
         self.lighting = Default::default();
         #[cfg(feature = "vulkan")]
@@ -1750,6 +1755,20 @@ impl TextureCache {
     fn wrote(&mut self, addr: u32, size: u32) {
         if self.written.last() != Some(&(addr, size)) {
             self.written.push((addr, size));
+        }
+    }
+
+    /// A completed external/Metal write must advance even for consecutive writes
+    /// to the same range: a texture may have been decoded between them.
+    pub(crate) fn invalidate_range(&mut self, addr: u32, size: u32) {
+        if size != 0 {
+            self.written.push((addr, size));
+            for ((base, _, _, _, _), entry) in self.entries.iter_mut() {
+                let length = entry.bytes.len() as u64;
+                if (*base as u64) < addr as u64 + size as u64 && (addr as u64) < *base as u64 + length {
+                    entry.watch = None;
+                }
+            }
         }
     }
 
