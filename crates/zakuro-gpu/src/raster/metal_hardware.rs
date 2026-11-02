@@ -920,6 +920,12 @@ impl HardwareMetal {
         uniforms_words: &[u32],
         tables_words: &[u32],
     ) -> Result<(), String> {
+        if key.vertex != VertexStage::Placed {
+            return Err("Metal placed executor cannot run interpreted vertices".into());
+        }
+        if key.depth != draw.depth.is_some() {
+            return Err("Metal depth attachment does not match pipeline key".into());
+        }
         // the ring takes the uniforms, the tables, the vertices: the
         // Vulkan raster's batch's start
         let mut uniforms_block = Block { words: uniforms_words.to_vec(), last: Vec::new(), at: None };
@@ -1061,7 +1067,7 @@ impl HardwareMetal {
             depth_pixel_format(key.float_depth)
         } else {
             // without depth the descriptor only needs the colour target
-            MTLPixelFormat::RGBA8Unorm
+            MTLPixelFormat::Invalid
         };
         descriptor.setStencilAttachmentPixelFormat(depth_format);
         descriptor.setDepthAttachmentPixelFormat(depth_format);
@@ -1070,6 +1076,7 @@ impl HardwareMetal {
             let colour: Retained<objc2_metal::MTLRenderPipelineColorAttachmentDescriptor> =
                 attachments.objectAtIndexedSubscript(0);
             colour.setPixelFormat(MTLPixelFormat::RGBA8Unorm);
+            colour.setWriteMask(metal_color_mask(key.mask));
         }
         descriptor.setRasterSampleCount(1);
         descriptor.setVertexFunction(Some(vertex_function.as_ref()));
@@ -1095,6 +1102,16 @@ impl HardwareMetal {
         unsafe { self.device.newRenderPipelineStateWithDescriptor_error(&descriptor) }
             .map_err(|error| format!("no pipeline state: {error}"))
     }
+}
+
+/// PICA RGBA bits are low-to-high; Metal defines red at bit 3.
+fn metal_color_mask(mask: u32) -> objc2_metal::MTLColorWriteMask {
+    use objc2_metal::MTLColorWriteMask as Mask;
+    let mut result = Mask::empty();
+    for (bit, channel) in [Mask::Red, Mask::Green, Mask::Blue, Mask::Alpha].into_iter().enumerate() {
+        if mask & (1 << bit) != 0 { result |= channel; }
+    }
+    result
 }
 
 fn sampler_target(slot: u8) -> naga_msl::BindTarget {
@@ -1396,6 +1413,18 @@ impl HardwareMetal {
 
 #[cfg(all(target_os = "macos", feature = "metal"))]
 mod tests {
+    #[test]
+    fn pica_color_masks_map_all_channel_combinations_to_metal() {
+        use objc2_metal::MTLColorWriteMask as Mask;
+        let channels = [Mask::Red, Mask::Green, Mask::Blue, Mask::Alpha];
+        for bits in 0..16u32 {
+            let actual = super::metal_color_mask(bits);
+            for (index, channel) in channels.into_iter().enumerate() {
+                assert_eq!(actual.contains(channel), bits & (1 << index) != 0);
+            }
+        }
+    }
+
     use super::*;
     use objc2_metal::{MTLDevice as _, MTLPixelFormat};
 
@@ -2155,7 +2184,16 @@ mod tests {
         hardware.draw_placed(&draw, &key, &uniform_words, &[]).expect("the first draw runs");
         draw.clear = false;
         draw.indices = &indices[3..];
-        hardware.draw_placed(&draw, &key, &uniform_words, &[]).expect("the second draw preserves the first");
+        let red_only = PipelineKey { mask: 1, ..key };
+        hardware.draw_placed(&draw, &red_only, &uniform_words, &[]).expect("the second draw preserves unwritable channels");
+
+        // A no-depth pass with all channels masked must preserve the image.
+        draw.depth = None;
+        let no_writes = PipelineKey { mask: 0, depth: false, ..key };
+        hardware.draw_placed(&draw, &no_writes, &uniform_words, &[]).expect("color-only pipeline");
+        assert!(hardware.draw_placed(&draw, &key, &uniform_words, &[]).is_err());
+        let unsupported = PipelineKey { vertex: VertexStage::Interpreted, ..no_writes };
+        assert!(hardware.draw_placed(&draw, &unsupported, &uniform_words, &[]).is_err());
 
         let mut pixels = [0u8; WIDTH * HEIGHT * 4];
         unsafe {
@@ -2174,7 +2212,7 @@ mod tests {
             [pixels[at], pixels[at + 1], pixels[at + 2], pixels[at + 3]]
         };
         assert_eq!(screen(8, 24), [0u8, 255, 0, 255], "the green left half");
-        assert_eq!(screen(24, 24), [255u8, 0, 0, 255], "the red right half");
+        assert_eq!(screen(24, 24), [255u8, 13, 23, 255], "only red changes; green, blue and alpha stay loaded");
         assert_eq!(screen(8, 2), [10u8, 13, 23, 255], "the letterbox top");
         assert_eq!(screen(24, 2), [10u8, 13, 23, 255], "the letterbox top right");
     }
