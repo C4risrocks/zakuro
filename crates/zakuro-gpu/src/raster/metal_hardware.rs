@@ -854,6 +854,30 @@ impl Ring {
     }
 }
 
+/// the Draw block's words a draw carries, from the registers' words the
+/// Vulkan raster fills: the stage registers' pairs, the buffer-update,
+/// buffer-color, alpha-test and texture-config, the texture units' words,
+/// the depth-map flags. `STAGE_REGISTERS` stays hardware.rs's — the metal
+/// module reads the same decode through the shared host.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+pub(crate) fn draw_uniform_block(
+    registers: &[u32],
+    texture_config: u32,
+    depth_flags: u32,
+) -> Vec<u32> {
+    let mut block = Vec::with_capacity(1504 / 4);
+    for base in [0x0C0usize, 0x0C8, 0x0D0, 0x0D8, 0x0F0, 0x0F8] {
+        block.extend([registers[base], registers[base + 1], registers[base + 2], registers[base + 3], registers[base + 4], 0, 0, 0]);
+    }
+    block.extend([registers[0x0E0], registers[0x0FD], registers[0x0A0], texture_config]);
+    for base in [0x0E8usize, 0x0F4usize] {
+        // the texture units' blocks: the configuration and the border color
+        block.extend([registers[base + 2], registers[base], 0, 0]);
+    }
+    block.extend([depth_flags, 0]);
+    block
+}
+
 /// A draw's execution on the Metal host: 24-float placed vertices packed
 /// the Vulkan raster's own way (the hardware.rs `place`'s values), the
 /// uniforms' words per draw, a real pipeline from the rack, the textures
