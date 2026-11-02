@@ -2362,9 +2362,9 @@ impl DepthStencil {
 /// how clip-space depth becomes the value in the depth buffer, z/w scaled and
 /// offset by GPUREG_DEPTHMAP_SCALE and _OFFSET.
 #[derive(Debug, Clone, Copy)]
-struct DepthMap {
-    scale: f32,
-    offset: f32,
+pub(crate) struct DepthMap {
+    pub(crate) scale: f32,
+    pub(crate) offset: f32,
     /// a w-buffer multiplies the mapped value by w.
     w_buffer: bool,
 }

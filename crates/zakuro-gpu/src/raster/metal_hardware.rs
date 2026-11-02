@@ -202,6 +202,34 @@ fn sampler_declaration(line: &str) -> Option<(u32, u32, String)> {
     (!name.is_empty()).then_some((set, binding, name))
 }
 
+/// a draw's placed vertices packed the hardware.rs `place`'s own way: the
+/// 24-float rows the vertex shader reads, from the CPU-placed `Screen`s.
+pub(crate) fn pack_placed(
+    vertices: &[super::Screen],
+    width: u32,
+    height: u32,
+    depth_map: &super::DepthMap,
+) -> Vec<f32> {
+    let mut out = Vec::with_capacity(vertices.len() * 24);
+    for v in vertices {
+        let w = 1.0 / v.inv_w;
+        let x = v.x / width as f32 * 2.0 - 1.0;
+        let y = v.y / height as f32 * 2.0 - 1.0;
+        let depth = v.z * depth_map.scale + depth_map.offset;
+        let (c, t, q, view) = (v.color_over_w, v.texcoords_over_w, v.quaternion_over_w, v.view_over_w);
+        out.extend([
+            x * w, y * w, 0.0, w,
+            c[0] * w, c[1] * w, c[2] * w, c[3] * w,
+            t[0][0] * w, t[0][1] * w, t[1][0] * w, t[1][1] * w,
+            t[2][0] * w, t[2][1] * w, depth, 0.0,
+            q[0] * w, q[1] * w, q[2] * w, q[3] * w,
+            view[0] * w, view[1] * w, view[2] * w,
+            v.texcoord0_w_over_w * w,
+        ]);
+    }
+    out
+}
+
 /// a local helper (the backend's own `ns` stays private there).
 fn ns(s: &str) -> Retained<NSString> {
     NSString::from_str(s)
