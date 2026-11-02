@@ -39,6 +39,8 @@ use objc2_foundation::NSString;
 #[cfg(all(target_os = "macos", feature = "metal"))]
 use std::ptr::NonNull;
 #[cfg(all(target_os = "macos", feature = "metal"))]
+use objc2_metal::MTLBuffer as _;
+#[cfg(all(target_os = "macos", feature = "metal"))]
 use objc2_metal::{
     MTLCommandQueue as _, MTLCreateSystemDefaultDevice, MTLDevice as _, MTLPixelFormat,
     MTLLibrary as _, MTLRenderPipelineDescriptor, MTLVertexStepFunction,
@@ -643,6 +645,99 @@ impl Ring {
     }
 }
 
+/// the words a batch gathers, staged once per batch: the Vulkan twin's
+/// `Block` with the same dedupe (draws in a row mostly share the words —
+/// the host rewrites only when the words differ).
+#[derive(Default)]
+pub struct Block {
+    /// the words being gathered.
+    words: Vec<u32>,
+    /// the words staged last, and where, until the batch is handed over.
+    last: Vec<u32>,
+    at: Option<u64>,
+}
+
+impl Block {
+    /// where the batch holds the words gathered, when they are the words
+    /// the last block of the kind staged.
+    pub fn staged(&self) -> Option<u64> {
+        self.at.filter(|_| self.words == self.last)
+    }
+
+    /// the words gathered went into the batch at offset.
+    pub fn staged_at(&mut self, offset: u64) {
+        std::mem::swap(&mut self.words, &mut self.last);
+        self.at = Some(offset);
+    }
+}
+
+impl Ring {
+    /// takes a span at the alignment asked, the Vulkan `stage`'s shape:
+    /// `next_multiple_of` on the head, bounds against the capacity.
+    pub fn stage(&mut self, size: u64, align: u64) -> Result<(u64, NonNull<u8>), String> {
+        let offset = self.head.next_multiple_of(align.max(1));
+        if offset + size > self.capacity {
+            return Err(format!("a draw needs {size} more bytes than a batch has"));
+        }
+        self.head = offset + size;
+        let extra = self.head - offset - size; // (the wrap while staging)
+        let _ = extra;
+        // reuse take's span bookkeeping for the aligned offset
+        let contiguous = self
+            .live
+            .back()
+            .is_some_and(|(start, bytes)| start + bytes == offset);
+        if contiguous {
+            // extend the last span
+            let (start, bytes) = self.live.back_mut().unwrap();
+            *bytes = offset + size - *start;
+        } else {
+            // not contiguous: its own span
+            self.live.push_back((offset, size));
+        }
+        let pointer = unsafe {
+            self.buffer.contents().cast::<u8>().add(offset as usize)
+        };
+        Ok((offset, pointer))
+    }
+
+    /// the write window for a staged span, the twin of hardware.rs's
+    /// `ring(offset, size)`.
+    pub fn span(&self, start: u64, size: u64) -> &mut [u8] {
+        // SAFETY: the ring is Shared-mapped for its whole size and stage
+        // kept the range inside it; the GPU is not reading this batch's
+        // span while it is being recorded (A3b's one-frame channel says
+        // the host and the GPU never touch the same bytes at once)
+        unsafe {
+            std::slice::from_raw_parts_mut(
+                self.buffer.contents().cast::<u8>().add(start as usize).as_ptr(),
+                size as usize,
+            )
+        }
+    }
+
+    /// stages the block's words once per batch, at the alignment asked —
+    /// the Vulkan `stage_block`'s shape: the dedupe via Block::staged, the
+    /// words written little-endian into the ring's bytes.
+    pub fn stage_block(
+        &mut self,
+        block: &mut Block,
+        align: u64,
+    ) -> Result<u64, String> {
+        let size = block.words.len() as u64 * 4;
+        if let Some(at) = block.staged() {
+            return Ok(at);
+        }
+        let (offset, _) = self.stage(size, align)?;
+        let window = self.span(offset, size);
+        for (out, word) in window.as_chunks_mut::<4>().0.iter_mut().zip(&block.words) {
+            *out = word.to_le_bytes();
+        }
+        block.staged_at(offset);
+        Ok(offset)
+    }
+}
+
 #[cfg(all(target_os = "macos", feature = "metal"))]
 mod tests {
     use super::*;
@@ -684,6 +779,36 @@ mod tests {
         // taking too much errors honestly
         let too_big = ring.take((1 << 12) as u64);
         assert!(too_big.is_err(), "the overflow refuses");
+    }
+
+    #[test]
+    fn stage_block_stages_once_and_reuses_the_offset() {
+        use objc2_metal::{MTLCreateSystemDefaultDevice, MTLDevice as _};
+        let device = MTLCreateSystemDefaultDevice().expect("the device");
+        let mut ring = Ring::new(device.as_ref(), 1 << 12).expect("the ring");
+        let mut block = Block::default();
+        block.words = vec![0xDEAD_BEEF, 0x1234_5678];
+
+        // first stage: the span lands at the 16-byte alignment the draw
+        // uniforms ask, the words land little-endian in the bytes
+        let first = ring.stage_block(&mut block, 16).expect("the first stage");
+        assert_eq!(first, 0, "the aligned head starts the batch");
+        let bytes = ring.span(first, 8);
+        assert_eq!(bytes, &[0xEF, 0xBE, 0xAD, 0xDE, 0x78, 0x56, 0x34, 0x12]);
+
+        // the shared draw re-gathers the same words: the dedupe returns
+        // the offset bygones (the words empty after the swap, the draw
+        // refills them identically — the Vulkan Block's own shape)
+        block.words = vec![0xDEAD_BEEF, 0x1234_5678];
+        let again = ring.stage_block(&mut block, 16).expect("the dedupe");
+        assert_eq!(again, first, "the shared words restage for free");
+
+        // new words: the stage walks the head
+        block.words = vec![1, 2, 3, 4];
+        let third = ring.stage_block(&mut block, 16).expect("the next stage");
+        assert!(third >= first + 8, "the new words stage past the old");
+        let bytes = ring.span(third, 16);
+        assert_eq!(bytes, &[1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0, 4, 0, 0, 0]);
     }
 
     #[test]
