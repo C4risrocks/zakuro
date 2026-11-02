@@ -878,20 +878,23 @@ pub(crate) fn draw_uniform_block(
     block
 }
 
-/// A draw's execution on the Metal host: 24-float placed vertices packed
-/// the Vulkan raster's own way (the hardware.rs `place`'s values), the
-/// uniforms' words per draw, a real pipeline from the rack, the textures
-/// bound by slot, the target as the caller decides.
+/// One explicit texture/sampler pair; the caller owns filtering and wrapping.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+#[derive(Clone, Copy)]
+pub struct TextureBinding<'a> {
+    pub texture: &'a ProtocolObject<dyn objc2_metal::MTLTexture>,
+    pub sampler: &'a ProtocolObject<dyn objc2_metal::MTLSamplerState>,
+}
+
+/// CPU-placed draw inputs, borrowed until synchronous GPU completion.
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub struct PlacedDraw<'a> {
     /// the vertices' 24-float rows, packed the Vulkan `place`'s way.
     pub vertices: &'a [f32],
     /// three indices a triangle, the draw's triangles' shape.
     pub indices: &'a [u32],
-    /// the uniforms' words (the key's shape the DYNAMIC path counts).
-    pub uniform_words: &'a [u32],
-    /// the texture unit 0's GPU texture, when the draw samples one.
-    pub texture0: Option<&'a ProtocolObject<dyn objc2_metal::MTLTexture>>,
+    /// PICA texture units 0..2, with an explicit sampler for every bound unit.
+    pub textures: [Option<TextureBinding<'a>>; 3],
     /// the render target's RGBA8 texture.
     pub target: &'a ProtocolObject<dyn objc2_metal::MTLTexture>,
     /// Explicit initialization only; subsequent draws must load both attachments.
@@ -926,6 +929,16 @@ impl HardwareMetal {
         if key.depth != draw.depth.is_some() {
             return Err("Metal depth attachment does not match pipeline key".into());
         }
+        if uniforms_words.len() < 408 {
+            return Err("Metal Draw uniform block is truncated".into());
+        }
+        for unit in 0..3 {
+            if uniforms_words[51] & (1 << unit) != 0 && draw.textures[unit].is_none() {
+                return Err(format!("Metal texture unit {unit} is enabled but unbound"));
+            }
+        }
+        let table_bytes = u32::try_from(tables_words.len() * 4)
+            .map_err(|_| "Metal Tables buffer is too large")?;
         // the ring takes the uniforms, the tables, the vertices: the
         // Vulkan raster's batch's start
         let mut uniforms_block = Block { words: uniforms_words.to_vec(), last: Vec::new(), at: None };
@@ -976,10 +989,13 @@ impl HardwareMetal {
             encoder.setVertexBuffer_offset_atIndex(Some(self.ring.buffer_of()), vertex_at as usize, 0);
             encoder.setFragmentBuffer_offset_atIndex(Some(self.ring.buffer_of()), uniforms_at as usize, 3);
             encoder.setFragmentBuffer_offset_atIndex(Some(self.ring.buffer_of()), tables_at as usize, 4);
-            match draw.texture0 {
-                Some(texture) => encoder.setFragmentTexture_atIndex(Some(texture), 0),
-                None => {},
+            for (unit, binding) in draw.textures.iter().enumerate() {
+                encoder.setFragmentTexture_atIndex(binding.map(|b| b.texture), unit);
+                encoder.setFragmentSamplerState_atIndex(binding.map(|b| b.sampler), 10 + unit);
             }
+            // Naga's only runtime-sized global is Tables: one byte-length word.
+            encoder.setFragmentBytes_length_atIndex(
+                NonNull::from(&table_bytes).cast(), 4, 30);
             encoder.drawIndexedPrimitives_indexCount_indexType_indexBuffer_indexBufferOffset(
                 objc2_metal::MTLPrimitiveType::Triangle,
                 draw.indices.len(),
@@ -2142,7 +2158,7 @@ mod tests {
 
         // the uniforms: the six pass-through stages, the words exactly as
         // the draw's registers carry them
-        let mut uniform_words = [0u32; 376];
+        let mut uniform_words = [0u32; 408];
         for stage in 0..6 {
             let at = stage * 4;
             uniform_words[at] = 0x000F_000F;
@@ -2172,8 +2188,7 @@ mod tests {
         let mut draw = PlacedDraw {
             vertices: &vertices,
             indices: &indices[..3],
-            uniform_words: &uniform_words,
-            texture0: None,
+            textures: [None; 3],
             target: color_target.as_ref(),
             clear: true,
             depth: Some(depth_target.as_ref()),
@@ -2215,6 +2230,66 @@ mod tests {
         assert_eq!(screen(24, 24), [255u8, 13, 23, 255], "only red changes; green, blue and alpha stay loaded");
         assert_eq!(screen(8, 2), [10u8, 13, 23, 255], "the letterbox top");
         assert_eq!(screen(24, 2), [10u8, 13, 23, 255], "the letterbox top right");
+
+        // Exercise all three texture/sampler slots through the real fragment shader.
+        let sampler_desc = objc2_metal::MTLSamplerDescriptor::new();
+        sampler_desc.setMinFilter(objc2_metal::MTLSamplerMinMagFilter::Nearest);
+        sampler_desc.setMagFilter(objc2_metal::MTLSamplerMinMagFilter::Nearest);
+        let sampler = hardware.device.newSamplerStateWithDescriptor(&sampler_desc).unwrap();
+        let tex_desc = MTLTextureDescriptor::new();
+        tex_desc.setPixelFormat(MTLPixelFormat::RGBA8Unorm);
+        tex_desc.setStorageMode(MTLStorageMode::Managed);
+        tex_desc.setUsage(MTLTextureUsage::ShaderRead);
+        unsafe { tex_desc.setWidth(1); tex_desc.setHeight(1); }
+        let colors = [[255u8, 0, 0, 255], [0, 255, 0, 255], [0, 0, 255, 255]];
+        let textures: Vec<_> = colors.iter().map(|pixel| {
+            let texture = hardware.device.newTextureWithDescriptor(&tex_desc).unwrap();
+            unsafe {
+                texture.replaceRegion_mipmapLevel_withBytes_bytesPerRow(
+                    MTLRegion { origin: MTLOrigin { x: 0, y: 0, z: 0 },
+                        size: objc2_metal::MTLSize { width: 1, height: 1, depth: 1 } },
+                    0, NonNull::from(&pixel[..]).cast(), 4);
+            }
+            texture
+        }).collect();
+        draw.textures = std::array::from_fn(|unit| Some(TextureBinding {
+            texture: textures[unit].as_ref(), sampler: sampler.as_ref(),
+        }));
+        let mut sampled_words = [0u32; 408];
+        for stage in 0..6 { sampled_words[stage * 8] = 0x000F_000F; }
+        for unit in 0..3 {
+            let source = 3 + unit as u32;
+            sampled_words[0] = source | (source << 16);
+            sampled_words[51] = 1 << unit;
+            let sampling_key = PipelineKey { mask: 15, ..no_writes };
+            hardware.draw_placed(&draw, &sampling_key, &sampled_words, &[0; 2]).unwrap();
+            let mut pixel = [0u8; 4];
+            unsafe {
+                color_target.getBytes_bytesPerRow_fromRegion_mipmapLevel(
+                    NonNull::from(&mut pixel[..]).cast(), 4,
+                    MTLRegion { origin: MTLOrigin { x: 24, y: 24, z: 0 },
+                        size: objc2_metal::MTLSize { width: 1, height: 1, depth: 1 } }, 0);
+            }
+            assert_eq!(pixel, colors[unit], "texture/sampler unit {unit}");
+        }
+        // Fog reads a runtime-sized table and the last vec4 of Draw.
+        // With a 0.5 factor, blue mixed with yellow produces grey.
+        sampled_words[48] = 5;
+        sampled_words[404] = 0x0000_FFFF;
+        let mut tables = vec![0u32; (7552 + 128) * 2];
+        for pair in tables.chunks_exact_mut(2) { pair[0] = 0.5f32.to_bits(); }
+        hardware.draw_placed(&draw, &PipelineKey { mask: 15, ..no_writes }, &sampled_words, &tables).unwrap();
+        let mut fog_pixel = [0u8; 4];
+        unsafe {
+            color_target.getBytes_bytesPerRow_fromRegion_mipmapLevel(
+                NonNull::from(&mut fog_pixel[..]).cast(), 4,
+                MTLRegion { origin: MTLOrigin { x: 24, y: 24, z: 0 },
+                    size: objc2_metal::MTLSize { width: 1, height: 1, depth: 1 } }, 0);
+        }
+        assert_eq!(fog_pixel, [127, 127, 127, 255], "Draw tail and Tables size binding");
+        draw.textures[2] = None;
+        assert!(hardware.draw_placed(&draw, &no_writes, &sampled_words, &[]).is_err());
+        assert!(hardware.draw_placed(&draw, &no_writes, &[], &[]).is_err());
     }
 
     #[test]
