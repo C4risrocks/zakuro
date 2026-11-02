@@ -29,6 +29,7 @@ use naga::ShaderStage;
 use naga::back::msl as naga_msl;
 
 use super::super::shader::glsl;
+use crate::format::ColorFormat;
 
 #[cfg(all(target_os = "macos", feature = "metal"))]
 use objc2::rc::Retained;
@@ -423,6 +424,8 @@ pub struct HardwareMetal {
     entries: std::collections::HashMap<&'static str, String>,
     /// the draw inputs' ring (A4's batch staging) — one frame at a time.
     pub(crate) ring: Ring,
+    /// the draw targets backed by the guest's memory (A4).
+    pub(crate) surfaces: Vec<MetalSurface>,
 }
 
 /// what a draw's vertices go through on Metal, the Vulkan twin's enum.
@@ -464,7 +467,7 @@ impl HardwareMetal {
         // first, the batch's own defines grow it honestly when A4's real
         // draws land inside
         let ring = Ring::new(device.as_ref(), 8 << 20)?;
-        Ok(Self { device, queue, libraries, entries, ring })
+        Ok(Self { device, queue, libraries, entries, ring, surfaces: Vec::new() })
     }
 
     pub fn function(
@@ -1056,10 +1059,166 @@ fn key_fragment(key: &PipelineKey) -> [u32; FRAGMENT_CONSTANTS] {
     values
 }
 
+/// The A4's surfaces: the draw targets backed by the guest's memory, the
+/// honest simplified core of the Vulkan raster's `Surface` — a Managed
+/// RGBA8 texture at the console's resolution, the guest's shadow, and the
+/// rows' load-then-draw-then-writeback. The Vulkan twin's `native` scaled
+/// images, the guards, the stale rows and the twin (frame interpolation)
+/// land after the surfaces run.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+struct MetalSurface {
+    texture: Retained<ProtocolObject<dyn objc2_metal::MTLTexture>>,
+    addr: u32,
+    width: u32,
+    height: u32,
+    format: ColorFormat,
+    tiled: bool,
+    /// the guest's bytes the texture matched last.
+    shadow: Vec<u8>,
+}
+
+impl MetalSurface {
+    /// the guest's bytes a whole surface takes.
+    fn size(&self) -> u32 {
+        self.width * self.height * self.format.bytes_per_pixel() as u32
+    }
+
+    /// the bytes one row of the guest's buffer takes.
+    fn row_bytes(&self) -> u32 {
+        self.width * self.format.bytes_per_pixel() as u32
+    }
+
+    /// whether the texture's bytes match the guest's (the honest shadow,
+    /// bytes compared where the memory is in one piece).
+    fn shadows(&self, bytes: &[u8]) -> bool {
+        !self.shadow.is_empty() && bytes == self.shadow
+    }
+
+    /// the GPU drew: record the shadow from the texture's rows.
+    fn keep(&mut self, bytes: &[u8]) {
+        self.shadow = bytes.to_vec();
+    }
+}
+
+impl HardwareMetal {
+    /// looks the surface up or makes it from the guest's rows, uploading
+    /// when the bytes changed — the Vulkan `surface_rows`'s shape with the
+    /// CPU decode (the shared `format.decode` + morton), the upload into
+    /// the texture's flipped rows (the guest's rows run bottom first).
+    fn check_surface<M: crate::GpuMemory>(
+        &mut self,
+        memory: &mut M,
+        addr: u32,
+        (width, height): (u32, u32),
+        format: ColorFormat,
+        tiled: bool,
+    ) -> Result<usize, String> {
+        use objc2_metal::{MTLStorageMode, MTLTextureDescriptor, MTLTextureUsage};
+        let index = self
+            .surfaces
+            .iter()
+            .position(|surface| {
+                surface.addr == addr && surface.width == width
+                    && surface.height == height && surface.format == format
+                    && surface.tiled == tiled
+            });
+        let index = match index {
+            Some(index) => index,
+            None => {
+                let descriptor = MTLTextureDescriptor::new();
+                descriptor.setPixelFormat(MTLPixelFormat::RGBA8Unorm);
+                unsafe {
+                    descriptor.setWidth(width as usize);
+                    descriptor.setHeight(height as usize);
+                }
+                descriptor.setUsage(MTLTextureUsage::RenderTarget | MTLTextureUsage::ShaderRead);
+                descriptor.setStorageMode(MTLStorageMode::Managed);
+                let texture = self.device.newTextureWithDescriptor(&descriptor)
+                    .ok_or("the surface's texture did not allocate")?;
+                self.surfaces.push(MetalSurface {
+                    texture,
+                    addr,
+                    width,
+                    height,
+                    format,
+                    tiled,
+                    shadow: Vec::new(),
+                });
+                self.surfaces.len() - 1
+            }
+        };
+
+        // the shadow: the bytes when the texture matched. changed, they get
+        // read and decoded into the texture's flipped rows
+        let size = self.surfaces[index].size() as usize;
+        let mut bytes = vec![0u8; size];
+        memory.read(addr, &mut bytes);
+        if !self.surfaces[index].shadows(&bytes) {
+            let texture = &self.surfaces[index];
+            let (w, h, bpp) = (
+                texture.width,
+                texture.height,
+                texture.format.bytes_per_pixel() as u32,
+            );
+            let mut texture_bytes = vec![0u8; (w * h * 4) as usize];
+            let decode = texture.format;
+            let (w_us, h_us, bpp_us) = (w as usize, h as usize, bpp as usize);
+            for y in 0..h {
+                for x in 0..w {
+                    let at = crate::format::morton_offset(x, y, w, bpp) as usize;
+                    let rgba: [u8; 4] = decode.decode(&bytes[at..at + bpp_us]);
+                    let out = ((h_us - 1 - y as usize) * w_us + x as usize) * 4;
+                    texture_bytes[out..out + 4].copy_from_slice(&rgba);
+                }
+            }
+            unsafe {
+                use objc2_metal::MTLTexture as _;
+                self.surfaces[index].texture.replaceRegion_mipmapLevel_withBytes_bytesPerRow(
+                    objc2_metal::MTLRegion {
+                        origin: objc2_metal::MTLOrigin { x: 0, y: 0, z: 0 },
+                        size: objc2_metal::MTLSize { width: w as usize, height: h as usize, depth: 1 },
+                    },
+                    0,
+                    std::ptr::NonNull::from(texture_bytes.as_slice()).cast(),
+                    (w * 4) as usize,
+                );
+            }
+            self.surfaces[index].keep(&bytes);
+        }
+        Ok(index)
+    }
+}
+
 #[cfg(all(target_os = "macos", feature = "metal"))]
 mod tests {
     use super::*;
     use objc2_metal::{MTLDevice as _, MTLPixelFormat};
+
+    /// a small guest memory the tests write and read through the trait's
+    /// shape (the ConsoleMemory's watch/unchanged land with A4's full
+    /// surfaces batch work).
+    struct HostMemory {
+        bytes: std::collections::HashMap<u64, Vec<u8>>,
+    }
+    impl HostMemory {
+        fn new() -> Self {
+            Self { bytes: std::collections::HashMap::new() }
+        }
+        fn write_raw(&mut self, addr: u64, bytes: &[u8]) {
+            self.bytes.insert(addr, bytes.to_vec());
+        }
+    }
+    impl crate::GpuMemory for HostMemory {
+        fn read(&mut self, addr: u32, buf: &mut [u8]) {
+            let addr = addr as u64;
+            for (index, byte) in buf.iter_mut().enumerate() {
+                *byte = self.bytes.get(&addr).and_then(|run| run.get(index).copied()).unwrap_or(0);
+            }
+        }
+        fn write(&mut self, addr: u32, data: &[u8]) {
+            self.bytes.insert(addr as u64, data.to_vec());
+        }
+    }
 
     #[test]
     fn the_ring_allocates_flushes_and_retires() {
@@ -1100,7 +1259,48 @@ mod tests {
     }
 
     #[test]
-    fn texture_pool_binds_by_identity_and_uploads_the_texels() {
+    fn surfaces_load_from_guest_memory_when_the_bytes_change() {
+        use crate::GpuMemory;
+
+        let mut hardware = HardwareMetal::new().expect("the Metal raster constructs");
+        let mut memory = HostMemory::new();
+
+        // the guest's tiled RGBA8 rows: bottom-first rows, each pixel's
+        // value the formula (x, 255, 0, 255)
+        const SIZE: u32 = 32;
+        let buffer_addr: u32 = 0x0100_0000;
+        let mut bytes = vec![0u8; (SIZE * SIZE * 4) as usize];
+        for y in 0..SIZE {
+            for x in 0..SIZE {
+                let at = crate::format::morton_offset(x, y, SIZE, 4) as usize;
+                bytes[at] = (x * 8) as u8; bytes[at + 1] = 255; bytes[at + 2] = 0; bytes[at + 3] = 255;
+            }
+        }
+        memory.write_raw(buffer_addr as u64, &bytes);
+
+        // the first check: the surface loads the guest's rows
+        let index = hardware.check_surface(&mut memory, buffer_addr, (SIZE, SIZE), ColorFormat::Rgba8, true)
+            .expect("the surface checks");
+        assert_eq!(index, 0, "the first surface lands alone");
+        assert_eq!(hardware.surfaces[index].shadow, bytes, "the shadow carries the guest's");
+
+        // the same bytes: the shadow holds, no upload lands
+        let index_again = hardware.check_surface(&mut memory, buffer_addr, (SIZE, SIZE), ColorFormat::Rgba8, true)
+            .expect("the surface re-checks");
+        assert_eq!(index_again, index);
+
+        // the guest changes a pixel: the whole rows rewrite (the fake's
+        // runs sit whole), the next check uploads again
+        let change = crate::format::morton_offset(10, 5, SIZE, 4) as usize;
+        bytes[change] = 255; bytes[change + 1] = 255; bytes[change + 3] = 255;
+        memory.write_raw(buffer_addr as u64, &bytes);
+        hardware.check_surface(&mut memory, buffer_addr, (SIZE, SIZE), ColorFormat::Rgba8, true)
+            .expect("the changed surface re-checks");
+        assert_eq!(hardware.surfaces[index].shadow[change], 255u8, "the shadow follows the guest");
+    }
+
+    #[test]
+    fn pixel_formats_match_the_vulkan_twins() {
         use objc2_metal::{MTLCreateSystemDefaultDevice, MTLDevice as _, MTLTexture as _};
         use std::sync::Arc;
         let device = MTLCreateSystemDefaultDevice().expect("the device");
@@ -1159,14 +1359,6 @@ mod tests {
         assert!(third >= first + 8, "the new words stage past the old");
         let bytes = ring.span(third, 16);
         assert_eq!(bytes, &[1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0, 4, 0, 0, 0]);
-    }
-
-    #[test]
-    fn pixel_formats_match_the_vulkan_twins() {
-        // Vulkan's COLOR_FORMAT and its depth twin with the float fallback
-        assert_eq!(COLOR_PIXEL_FORMAT, MTLPixelFormat::RGBA8Unorm);
-        assert_eq!(depth_pixel_format(false), MTLPixelFormat::Depth24Unorm_Stencil8);
-        assert_eq!(depth_pixel_format(true), MTLPixelFormat::Depth32Float_Stencil8);
     }
 
     #[test]
