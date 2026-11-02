@@ -11,6 +11,8 @@ use crate::lighting::{Lighting, Tables};
 
 #[cfg(feature = "vulkan")]
 pub(crate) mod hardware;
+#[cfg(any(feature = "vulkan", all(feature = "metal", target_os = "macos")))]
+mod pica_state;
 #[cfg(all(feature = "metal", target_os = "macos"))]
 pub mod metal_hardware;
 

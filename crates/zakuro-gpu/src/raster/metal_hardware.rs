@@ -854,29 +854,7 @@ impl Ring {
     }
 }
 
-/// the Draw block's words a draw carries, from the registers' words the
-/// Vulkan raster fills: the stage registers' pairs, the buffer-update,
-/// buffer-color, alpha-test and texture-config, the texture units' words,
-/// the depth-map flags. `STAGE_REGISTERS` stays hardware.rs's — the metal
-/// module reads the same decode through the shared host.
-#[cfg(all(target_os = "macos", feature = "metal"))]
-pub(crate) fn draw_uniform_block(
-    registers: &[u32],
-    texture_config: u32,
-    depth_flags: u32,
-) -> Vec<u32> {
-    let mut block = Vec::with_capacity(1504 / 4);
-    for base in [0x0C0usize, 0x0C8, 0x0D0, 0x0D8, 0x0F0, 0x0F8] {
-        block.extend([registers[base], registers[base + 1], registers[base + 2], registers[base + 3], registers[base + 4], 0, 0, 0]);
-    }
-    block.extend([registers[0x0E0], registers[0x0FD], registers[0x0A0], texture_config]);
-    for base in [0x0E8usize, 0x0F4usize] {
-        // the texture units' blocks: the configuration and the border color
-        block.extend([registers[base + 2], registers[base], 0, 0]);
-    }
-    block.extend([depth_flags, 0]);
-    block
-}
+pub(crate) use super::pica_state::draw_uniform_block;
 
 /// One explicit texture/sampler pair; the caller owns filtering and wrapping.
 #[cfg(all(target_os = "macos", feature = "metal"))]
@@ -929,7 +907,7 @@ impl HardwareMetal {
         if key.depth != draw.depth.is_some() {
             return Err("Metal depth attachment does not match pipeline key".into());
         }
-        if uniforms_words.len() < 408 {
+        if uniforms_words.len() < super::pica_state::DRAW_WORDS {
             return Err("Metal Draw uniform block is truncated".into());
         }
         for unit in 0..3 {
@@ -2158,12 +2136,13 @@ mod tests {
 
         // the uniforms: the six pass-through stages, the words exactly as
         // the draw's registers carry them
-        let mut uniform_words = [0u32; 408];
-        for stage in 0..6 {
-            let at = stage * 4;
-            uniform_words[at] = 0x000F_000F;
-            uniform_words[at + 2] = 0x000F_000F;
+        let mut registers = vec![0u32; 0x300];
+        for base in [0x0C0, 0x0C8, 0x0D0, 0x0D8, 0x0F0, 0x0F8] {
+            registers[base] = 0x000F_000F;
         }
+        let mut uniform_words = Vec::new();
+        draw_uniform_block(&mut uniform_words, &registers, 0, 0,
+            super::super::DepthMap { scale: 1.0, offset: 0.0, w_buffer: false }, None);
         // the placed vertices, packed the Vulkan raster's own way
         let vertex = |x: f32, y: f32, r: f32, g: f32, b: f32| -> [f32; 24] {
             let mut data = [0.0f32; 24];
