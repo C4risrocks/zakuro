@@ -894,6 +894,8 @@ pub struct PlacedDraw<'a> {
     pub texture0: Option<&'a ProtocolObject<dyn objc2_metal::MTLTexture>>,
     /// the render target's RGBA8 texture.
     pub target: &'a ProtocolObject<dyn objc2_metal::MTLTexture>,
+    /// Explicit initialization only; subsequent draws must load both attachments.
+    pub clear: bool,
     /// the depth+stencil twin, when the draw carries depth.
     pub depth: Option<&'a ProtocolObject<dyn objc2_metal::MTLTexture>>,
     /// the draw's viewport width and height (the vertices sit in them).
@@ -948,14 +950,14 @@ impl HardwareMetal {
             let colour: Retained<objc2_metal::MTLRenderPassColorAttachmentDescriptor> =
                 attachments.objectAtIndexedSubscript(0);
             colour.setTexture(Some(draw.target));
-            colour.setLoadAction(MTLLoadAction::Clear);
+            colour.setLoadAction(if draw.clear { MTLLoadAction::Clear } else { MTLLoadAction::Load });
             colour.setStoreAction(MTLStoreAction::Store);
             colour.setClearColor(MTLClearColor { red: 0.04, green: 0.05, blue: 0.09, alpha: 1.0 });
             // the depth's twin, when the draw carries one
             if let Some(depth) = draw.depth {
                 let depth_attachment = pass.depthAttachment();
                 depth_attachment.setTexture(Some(depth));
-                depth_attachment.setLoadAction(MTLLoadAction::Clear);
+                depth_attachment.setLoadAction(if draw.clear { MTLLoadAction::Clear } else { MTLLoadAction::Load });
                 depth_attachment.setStoreAction(MTLStoreAction::Store);
                 depth_attachment.setClearDepth(1.0);
             }
@@ -2138,18 +2140,22 @@ mod tests {
         }
         let indices: [u32; 6] = [0, 1, 2, 3, 4, 5];
 
-        let draw = PlacedDraw {
+        let mut draw = PlacedDraw {
             vertices: &vertices,
-            indices: &indices,
+            indices: &indices[..3],
             uniform_words: &uniform_words,
             texture0: None,
             target: color_target.as_ref(),
+            clear: true,
             depth: Some(depth_target.as_ref()),
             width: WIDTH as u32,
             height: HEIGHT as u32,
         };
         let key = PipelineKey { mask: 0xF, depth: true, float_depth: true, vertex: VertexStage::Placed };
-        hardware.draw_placed(&draw, &key, &uniform_words, &[]).expect("the draw runs");
+        hardware.draw_placed(&draw, &key, &uniform_words, &[]).expect("the first draw runs");
+        draw.clear = false;
+        draw.indices = &indices[3..];
+        hardware.draw_placed(&draw, &key, &uniform_words, &[]).expect("the second draw preserves the first");
 
         let mut pixels = [0u8; WIDTH * HEIGHT * 4];
         unsafe {
