@@ -3459,6 +3459,7 @@ fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Re
                     Ok(()) => {
                         // the coherence's write-through says memory canonical —
                         // the guest holds what the GPU drew, nothing further
+                        crate::stats::shaded_gpu();
                         return Some(triangle_count as u32);
                     }
                     Err(error) => {
