@@ -347,7 +347,7 @@ impl Gpu {
 
         #[cfg(all(feature = "metal", target_os = "macos"))]
         if let Some(metal) = self.resources.metal_hardware.as_mut() {
-            metal.sync_guest(address, length as u32);
+            metal.sync_guest(memory, address, length as u32);
             self.resources.textures.invalidate_range(address, length as u32);
         }
         let bytes = value.to_le_bytes();
@@ -870,7 +870,7 @@ impl Gpu {
     pub fn sync_memory<M: GpuMemory>(&mut self, memory: &mut M, addr: u32, len: u32) {
         #[cfg(all(feature = "metal", target_os = "macos"))]
         if let Some(metal) = self.resources.metal_hardware.as_mut() {
-            metal.sync_guest(addr, len);
+            metal.sync_guest(memory, addr, len);
             self.resources.textures.invalidate_range(addr, len);
         }
         #[cfg(feature = "vulkan")]
@@ -889,7 +889,7 @@ impl Gpu {
     pub fn sync_depth<M: GpuMemory>(&mut self, memory: &mut M, addr: u32, len: u32) {
         #[cfg(all(feature = "metal", target_os = "macos"))]
         if let Some(metal) = self.resources.metal_hardware.as_mut() {
-            metal.sync_guest(addr, len);
+            metal.sync_guest(memory, addr, len);
             self.resources.textures.invalidate_range(addr, len);
         }
         #[cfg(feature = "vulkan")]

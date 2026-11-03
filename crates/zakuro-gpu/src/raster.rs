@@ -3352,41 +3352,48 @@ fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Re
 
     // the Metal host's honest dispatch: the placed draws run through the
     // coherence layer's write-through draw (guest memory canonical after
-    // every draw), and unsupported states fall back to the software path
-    // the way the Vulkan arm does. only whole Morton tiles arrive here —
+    // every draw), and every refusal — the state the host does not know,
+    // the packs, the drawn-surface textures, a refused bind — leaves the
+    // arm undrawn, the way the Vulkan arm does. nothing claims drawn what
+    // the host did not draw. only whole Morton tiles arrive here —
     // partial tiles draw software first.
+    #[cfg_attr(
+        not(all(feature = "metal", target_os = "macos")),
+        allow(unused_mut)
+    )]
+    let mut metal_count: Option<u32> = None;
     #[cfg(all(feature = "metal", target_os = "macos"))]
     if let Some(metal) = resources.metal_hardware.as_mut() {
         let target = &state.target;
         let depth = state.depth_stencil.is_some();
-        // the key and the block state from the draw's own registers; the
-        // unsupported states (logic ops beyond copy/noop, the fragment's
-        // LOD bias, drawn-surface textures and the packs) refuse and the
-        // software draw lands honest pixels instead
-        let raster_state = match metal_hardware::RasterState::from_pica(
-            registers,
-            depth,
-            state.lighting.is_some(),
-            state.proctex.is_some(),
-            false,
-        ) {
-            Ok(state) => state,
-            Err(reason) => {
-                log::trace!("Metal skipped this draw ({reason}), drawing software");
-                crate::stats::shaded_cpu();
-                return Some(triangle_count as u32);
+        'attempt: {
+            // the key and the block state from the draw's own registers;
+            // the unsupported states (logic ops beyond copy/noop, the
+            // fragment's LOD bias) refuse and the software draw lands
+            // honest pixels
+            let raster_state = match metal_hardware::RasterState::from_pica(
+                registers,
+                depth,
+                state.lighting.is_some(),
+                state.proctex.is_some(),
+                false,
+            ) {
+                Ok(state) => state,
+                Err(reason) => {
+                    log::trace!("Metal skipped this draw ({reason}), drawing software");
+                    break 'attempt;
+                }
+            };
+            // the packs and the drawn-surface textures ride out through the
+            // coherent fallback too
+            let packs = state.textures.iter().any(|bound| {
+                bound.as_ref().is_some_and(|bound| {
+                    bound.drawn.is_some() || bound.replacement.is_some()
+                })
+            });
+            if packs {
+                break 'attempt;
             }
-        };
-
-        // the packs and the drawn-surface textures ride out through the
-        // coherent fallback too
-        let packs = state.textures.iter().any(|bound| {
-            bound.as_ref().is_some_and(|bound| {
-                bound.drawn.is_some() || bound.replacement.is_some()
-            })
-        });
-        // don't draw packs or surface textures on met this iteration
-        if !packs {
             // pack the placed vertices the hardware.rs place()'s way
             let vertex_rows = metal_hardware::pack_placed(
                 placed, target.buffer_width, target.buffer_height, &state.depth_map,
@@ -3409,67 +3416,61 @@ fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Re
                 &mut packed_tables, state.tables, state.proctex_tables, state.fog_table,
             );
             // the three units' textures through the pool's identity
-            let mut owned: [Option<_>; 3] = [None, None, None];
-            let mut refused = false;
+            let mut owned: [Option<metal_hardware::OwnedTextureBinding>; 3] = [None, None, None];
             for (unit, bound) in state.textures.iter().enumerate() {
-                if let Some(bound) = bound {
-                    match metal.bind_pica_texture(bound) {
-                        Ok(owned_bind) => owned[unit] = Some(owned_bind),
-                        Err(reason) => {
-                            log::trace!("Metal texture unit {unit} refused ({reason}), drawing software");
-                            refused = true;
-                        }
+                let Some(bound) = bound else { continue };
+                match metal.bind_pica_texture(bound) {
+                    Ok(owned_bind) => owned[unit] = Some(owned_bind),
+                    Err(reason) => {
+                        log::trace!("Metal texture unit {unit} refused ({reason}), drawing software");
+                        break 'attempt;
                     }
                 }
             }
-            if !refused {
-                // the bindings live while the guest draw runs: the views
-                // built first, the owned ones still owned
-                let binding_views: [Option<metal_hardware::TextureBinding>; 3] = {
-                    let mut views: [Option<metal_hardware::TextureBinding>; 3] = [None, None, None];
-                    for unit in 0..3 {
-                        if let Some(owned) = owned[unit].as_ref() {
-                            views[unit] = Some(owned.borrowed());
-                        }
+            // the bindings live while the guest draw runs: the views are
+            // borrowed from the owned ones, which still own the textures
+            let mut binding_views: [Option<metal_hardware::TextureBinding>; 3] = [None, None, None];
+            for (unit, owned_bind) in owned.iter().enumerate() {
+                if let Some(owned_bind) = owned_bind {
+                    binding_views[unit] = Some(owned_bind.borrowed());
+                }
+            }
+            let guest = metal_hardware::coherence::GuestDraw {
+                target: metal_hardware::coherence::GuestTarget {
+                    addr: target.addr,
+                    width: target.buffer_width,
+                    height: target.buffer_height,
+                    format: target.format,
+                    tiled: true,
+                },
+                depth: state.depth_stencil.as_ref().map(|d| {
+                    metal_hardware::coherence::GuestDepth {
+                        addr: d.addr, bytes: d.bytes, tiled: true,
                     }
-                    views
-                };
-                let guest = metal_hardware::coherence::GuestDraw {
-                    target: metal_hardware::coherence::GuestTarget {
-                        addr: target.addr,
-                        width: target.buffer_width,
-                        height: target.buffer_height,
-                        format: target.format,
-                        tiled: true,
-                    },
-                    depth: state.depth_stencil.as_ref().map(|d| {
-                        metal_hardware::coherence::GuestDepth {
-                            addr: d.addr, bytes: d.bytes, tiled: true,
-                        }
-                    }),
-                    scale: 1,
-                    vertices: vertex_rows.as_slice(),
-                    indices,
-                    textures: binding_views,
-                    state: raster_state,
-                    uniforms: &uniforms,
-                    tables: &packed_tables,
-                };
-                match metal.draw_guest(memory, &guest, &mut resources.textures) {
-                    Ok(()) => {
-                        // the coherence's write-through says memory canonical —
-                        // the guest holds what the GPU drew, nothing further
-                        crate::stats::shaded_gpu();
-                        return Some(triangle_count as u32);
-                    }
-                    Err(error) => {
-                        log::error!("the Metal host refused the draw, {error}, drawing software");
-                        crate::stats::shaded_cpu();
-                        return Some(triangle_count as u32);
-                    }
+                }),
+                scale: 1,
+                vertices: vertex_rows.as_slice(),
+                indices,
+                textures: binding_views,
+                state: raster_state,
+                uniforms: &uniforms,
+                tables: &packed_tables,
+            };
+            match metal.draw_guest(memory, &guest, &mut resources.textures) {
+                Ok(()) => {
+                    // the coherence's write-through says memory canonical —
+                    // the guest holds what the GPU drew, nothing further
+                    crate::stats::shaded_gpu();
+                    metal_count = Some(triangle_count as u32);
+                }
+                Err(error) => {
+                    log::error!("the Metal host refused the draw, {error}, drawing software");
                 }
             }
         }
+    }
+    if let Some(count) = metal_count {
+        return Some(count);
     }
 
     #[cfg(feature = "vulkan")]

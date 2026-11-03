@@ -82,6 +82,33 @@ fn at(x: u32, y: u32, w: u32, bpp: u32, tiled: bool) -> usize {
 fn exec(s: impl Into<String>) -> CoherenceError {
     CoherenceError::Execution(s.into())
 }
+
+/// H6: the depth twin resident next to a color surface — the float image
+/// plus its readback planes and the shadow of the guest's bytes the image
+/// matched last. A draw stages only the bytes the guest moved since, and
+/// the pixels land in guest memory at the draw's write-back (the
+/// write-through the fences still keep).
+pub(crate) struct MetalDepth {
+    addr: u32,
+    width: u32,
+    height: u32,
+    bytes: u32,
+    tiled: bool,
+    scale: u32,
+    image: Retained<ProtocolObject<dyn MTLTexture>>,
+    depth_plane: Retained<ProtocolObject<dyn MTLBuffer>>,
+    stencil_plane: Retained<ProtocolObject<dyn MTLBuffer>>,
+    dr: usize,
+    sr: usize,
+    shadow: Vec<u8>,
+}
+
+impl MetalDepth {
+    /// the guest's bytes a whole depth surface takes.
+    fn size(&self) -> u32 {
+        self.width * self.height * self.bytes
+    }
+}
 fn texture(
     device: &ProtocolObject<dyn MTLDevice>,
     w: u32,
@@ -115,14 +142,188 @@ fn wait(buffer: &ProtocolObject<dyn MTLCommandBuffer>) -> Result<(), CoherenceEr
 }
 impl HardwareMetal {
     /// Safe because every Metal write is committed synchronously to guest memory.
-    pub(crate) fn sync_guest(&mut self, addr: u32, len: u32) {
+    pub(crate) fn sync_guest<M: GpuMemory>(&mut self, memory: &mut M, addr: u32, len: u32) {
+        // the fences write the resident images back before they drop: the
+        // guest keeps what the GPU drew, at every fence point
+        let color_hits: Vec<usize> = (0..self.surfaces.len())
+            .filter(|&i| overlaps(addr, len, self.surfaces[i].addr, self.surfaces[i].size()))
+            .collect();
+        for index in color_hits {
+            if let Err(error) = self.write_back(memory, index) {
+                log::error!("the Metal host could not write a surface back, {error}");
+            }
+        }
         self.surfaces
+            .retain(|s| !overlaps(addr, len, s.addr, s.size()));
+        let depth_hits: Vec<usize> = (0..self.depths.len())
+            .filter(|&i| overlaps(addr, len, self.depths[i].addr, self.depths[i].size()))
+            .collect();
+        for index in depth_hits {
+            if let Err(error) = self.finish_depth(memory, index) {
+                log::error!("the Metal host could not write a depth image back, {error}");
+            }
+        }
+        self.depths
             .retain(|s| !overlaps(addr, len, s.addr, s.size()));
         // Decoded identities may be reused after state restore or an external write.
         self.pica_textures.clear();
     }
+
+    /// the depth's resident image for this draw: found or made, and its
+    /// planes staged only when the guest's bytes moved since the image
+    /// last matched (the shadow). returns the entry and whether the
+    /// staged bytes need their upload blit in the draw's own buffer.
+    fn depth_for<M: GpuMemory>(
+        &mut self,
+        memory: &mut M,
+        d: GuestDepth,
+        nw: u32,
+        nh: u32,
+        scale: u32,
+    ) -> Result<(usize, bool), CoherenceError> {
+        let bytes = d.bytes;
+        let len = (nw * nh * bytes) as usize;
+        let mut fresh = vec![0u8; len];
+        memory.read(d.addr, &mut fresh);
+        let index = self.depths.iter().position(|entry| {
+            entry.addr == d.addr
+                && entry.width == nw
+                && entry.height == nh
+                && entry.bytes == bytes
+                && entry.tiled == d.tiled
+                && entry.scale == scale
+        });
+        let index = match index {
+            Some(index) => index,
+            None => {
+                let image = texture(
+                    &self.device,
+                    nw * scale,
+                    nh * scale,
+                    MTLPixelFormat::Depth32Float_Stencil8,
+                    true,
+                )?;
+                let (depth_plane, stencil_plane, dr, sr) =
+                    self.depth_planes(nw * scale, nh * scale)?;
+                self.depths.push(MetalDepth {
+                    addr: d.addr,
+                    width: nw,
+                    height: nh,
+                    bytes,
+                    tiled: d.tiled,
+                    scale,
+                    image,
+                    depth_plane,
+                    stencil_plane,
+                    dr,
+                    sr,
+                    shadow: Vec::new(),
+                });
+                self.depths.len() - 1
+            }
+        };
+        if fresh != self.depths[index].shadow {
+            let (w, h) = (nw * scale, nh * scale);
+            let maximum = if bytes == 2 { 65535.0 } else { 16777215.0 };
+            let (dr, sr) = (self.depths[index].dr, self.depths[index].sr);
+            let depth_plane = self.depths[index].depth_plane.clone();
+            let stencil_plane = self.depths[index].stencil_plane.clone();
+            unsafe {
+                let depths = std::slice::from_raw_parts_mut(
+                    depth_plane.contents().as_ptr() as *mut u8,
+                    dr * h as usize,
+                );
+                let stencils = std::slice::from_raw_parts_mut(
+                    stencil_plane.contents().as_ptr() as *mut u8,
+                    sr * h as usize,
+                );
+                for y in 0..h {
+                    for x in 0..w {
+                        let at = at(x / scale, y / scale, nw, bytes, d.tiled);
+                        let mut raw = [0u8; 4];
+                        raw[..bytes as usize].copy_from_slice(&fresh[at..at + bytes as usize]);
+                        let value = u32::from_le_bytes(raw)
+                            & if bytes == 2 { 65535 } else { 16777215 };
+                        let row = (h - 1 - y) as usize;
+                        depths[row * dr + x as usize * 4..row * dr + x as usize * 4 + 4]
+                            .copy_from_slice(&(value as f32 / maximum).to_le_bytes());
+                        stencils[row * sr + x as usize] =
+                            if bytes == 4 { raw[3] } else { 0 };
+                    }
+                }
+            }
+            self.depths[index].shadow = fresh;
+            Ok((index, true))
+        } else {
+            Ok((index, false))
+        }
+    }
+
+    /// the depth's truth lands in guest memory: the planes (already filled
+    /// by the draw's own readback blits on the waited command buffer) are
+    /// decoded at the samples the GPU changed, the exact guest bits of the
+    /// rest kept. the shadow then matches what memory holds.
+    fn finish_depth<M: GpuMemory>(
+        &mut self,
+        memory: &mut M,
+        index: usize,
+    ) -> Result<(), CoherenceError> {
+        let (addr, bytes, tiled, scale) = {
+            let entry = &self.depths[index];
+            (entry.addr, entry.bytes, entry.tiled, entry.scale)
+        };
+        let (nw, nh) = (self.depths[index].width, self.depths[index].height);
+        let (dr, sr) = (self.depths[index].dr, self.depths[index].sr);
+        let depth_plane = self.depths[index].depth_plane.clone();
+        let stencil_plane = self.depths[index].stencil_plane.clone();
+        let (w, h) = (nw * scale, nh * scale);
+        let len = (nw * nh * bytes) as usize;
+        let mut before = vec![0u8; len];
+        memory.read(addr, &mut before);
+        let mut out = before.clone();
+        let maximum = if bytes == 2 { 65535.0 } else { 16777215.0 };
+        unsafe {
+            let depths = std::slice::from_raw_parts(
+                depth_plane.contents().as_ptr() as *const u8,
+                dr * h as usize,
+            );
+            let stencils = std::slice::from_raw_parts(
+                stencil_plane.contents().as_ptr() as *const u8,
+                sr * h as usize,
+            );
+            for y in 0..nh {
+                for x in 0..nw {
+                    let at = at(x, y, nw, bytes, tiled);
+                    let row = (h - 1 - (y * scale + scale / 2)) as usize;
+                    let col = (x * scale + scale / 2) as usize;
+                    let value = f32::from_le_bytes(
+                        depths[row * dr + col * 4..row * dr + col * 4 + 4]
+                            .try_into()
+                            .unwrap(),
+                    );
+                    let mut raw = [0u8; 4];
+                    raw[..bytes as usize].copy_from_slice(&before[at..at + bytes as usize]);
+                    let previous =
+                        u32::from_le_bytes(raw) & if bytes == 2 { 65535 } else { 16777215 };
+                    // Preserve exact guest bits if the GPU did not change the sample.
+                    if value.to_bits() != (previous as f32 / maximum).to_bits() {
+                        let encoded = (value.clamp(0.0, 1.0) * maximum) as u32;
+                        let n = if bytes == 2 { 2 } else { 3 };
+                        out[at..at + n].copy_from_slice(&encoded.to_le_bytes()[..n]);
+                    }
+                    if bytes == 4 {
+                        out[at + 3] = stencils[row * sr + col];
+                    }
+                }
+            }
+        }
+        memory.write(addr, &out);
+        self.depths[index].shadow = out;
+        Ok(())
+    }
     pub(crate) fn forget_guest(&mut self) {
         self.surfaces.clear();
+        self.depths.clear();
         self.pica_textures.clear();
         self.pica_samplers.clear();
         self.ring.live.clear();
@@ -205,43 +406,23 @@ impl HardwareMetal {
         if draw.indices.is_empty() {
             return Ok(());
         }
-        let mut before = vec![0u8; len as usize];
-        memory.read(t.addr, &mut before);
-        let color = texture(&self.device, w, h, MTLPixelFormat::RGBA8Unorm, false)?;
-        let bpp = t.format.bytes_per_pixel() as u32;
-        let mut rgba = vec![0u8; (w * h * 4) as usize];
-        for y in 0..h {
-            for x in 0..w {
-                let src = at(x / draw.scale, y / draw.scale, t.width, bpp, t.tiled);
-                let dst = (((h - 1 - y) * w + x) * 4) as usize;
-                rgba[dst..dst + 4]
-                    .copy_from_slice(&t.format.decode(&before[src..src + bpp as usize]));
-            }
-        }
-        unsafe {
-            color.replaceRegion_mipmapLevel_withBytes_bytesPerRow(
-                MTLRegion {
-                    origin: MTLOrigin { x: 0, y: 0, z: 0 },
-                    size: MTLSize {
-                        width: w as usize,
-                        height: h as usize,
-                        depth: 1,
-                    },
-                },
-                0,
-                NonNull::from(&rgba[..]).cast(),
-                w as usize * 4,
-            );
-        }
-        let mut depth_before = vec![0u8; depth_len.unwrap_or(0) as usize];
-        if let Some(d) = draw.depth {
-            memory.read(d.addr, &mut depth_before);
-        }
-        let depth = if let Some(d) = draw.depth {
-            Some(self.upload_depth(d, t.width, t.height, draw.scale, &depth_before)?)
-        } else {
-            None
+        // H6: the color target mounts as a resident surface (the honest
+        // shadow scheme) and the depth twin as a resident float image. the
+        // frame's draws land into them, and every draw's write-back keeps
+        // the fence honest — guest memory canonical after every draw —
+        // without the per-draw texture and plane allocations, and with a
+        // single command buffer for the staged depth blits, the render
+        // pass, the depth readback and the color's Managed sync (one wait).
+        let color_index = self
+            .check_surface_at(memory, t.addr, (t.width, t.height), t.format, t.tiled, draw.scale)
+            .map_err(exec)?;
+        let color = self.surfaces[color_index].texture.clone();
+        let depth_index = match draw.depth {
+            Some(d) => Some(self.depth_for(memory, d, t.width, t.height, draw.scale)?),
+            None => None,
         };
+
+        // the float twin and the scaled scissor carry into the native draw
         let mut state = draw.state;
         state.key.float_depth = true;
         if let Some(rect) = state.scissor.as_mut() {
@@ -251,83 +432,120 @@ impl HardwareMetal {
                     .ok_or_else(|| CoherenceError::InvalidInput("scissor overflow".into()))?;
             }
         }
+        let depth_attachment = depth_index
+            .map(|(index, _)| index)
+            .map(|index| self.depths[index].image.clone());
         let native = PlacedDraw {
             vertices: draw.vertices,
             indices: draw.indices,
             textures: draw.textures,
             target: &color,
             clear: false,
-            depth: depth.as_deref(),
+            depth: depth_attachment.as_deref(),
             width: w,
             height: h,
         };
-        self.draw_placed_state(&native, &state, draw.uniforms, draw.tables)
-            .map_err(exec)?;
-        // Make Managed render output visible to the CPU before encoding guest bytes.
+
         let cb = self
             .queue
             .commandBuffer()
-            .ok_or_else(|| exec("readback command allocation"))?;
-        let blit = cb
-            .blitCommandEncoder()
-            .ok_or_else(|| exec("readback encoder allocation"))?;
-        unsafe {
-            blit.synchronizeResource((*color).as_ref());
-        }
-        blit.endEncoding();
-        wait(&cb).map_err(|e| {
-            self.failed = true;
-            e
-        })?;
-        let mut result = vec![0u8; rgba.len()];
-        unsafe {
-            color.getBytes_bytesPerRow_fromRegion_mipmapLevel(
-                NonNull::from(&mut result[..]).cast(),
-                w as usize * 4,
-                MTLRegion {
-                    origin: MTLOrigin { x: 0, y: 0, z: 0 },
-                    size: MTLSize {
-                        width: w as usize,
-                        height: h as usize,
-                        depth: 1,
-                    },
-                },
-                0,
-            );
-        }
-        let mut after = before.clone();
-        for y in 0..t.height {
-            for x in 0..t.width {
-                let px = x * draw.scale + draw.scale / 2;
-                let py = y * draw.scale + draw.scale / 2;
-                let src = (((h - 1 - py) * w + px) * 4) as usize;
-                if result[src..src + 4] != rgba[src..src + 4] {
-                    let dst = at(x, y, t.width, bpp, t.tiled);
-                    t.format.encode(
-                        result[src..src + 4].try_into().unwrap(),
-                        &mut after[dst..dst + bpp as usize],
+            .ok_or_else(|| exec("draw command allocation"))?;
+        // the staged depth's upload blits, only where the shadow moved
+        if let Some((index, true)) = depth_index {
+            let image = self.depths[index].image.clone();
+            let depth_plane = self.depths[index].depth_plane.clone();
+            let stencil_plane = self.depths[index].stencil_plane.clone();
+            let (dr, sr) = (self.depths[index].dr, self.depths[index].sr);
+            let blit = cb
+                .blitCommandEncoder()
+                .ok_or_else(|| exec("depth encoder allocation"))?;
+            unsafe {
+                for (buffer, row, option) in [
+                    (&depth_plane, dr, MTLBlitOption::DepthFromDepthStencil),
+                    (&stencil_plane, sr, MTLBlitOption::StencilFromDepthStencil),
+                ] {
+                    blit.copyFromBuffer_sourceOffset_sourceBytesPerRow_sourceBytesPerImage_sourceSize_toTexture_destinationSlice_destinationLevel_destinationOrigin_options(
+                        buffer,
+                        0,
+                        row,
+                        row * h as usize,
+                        MTLSize { width: w as usize, height: h as usize, depth: 1 },
+                        &image,
+                        0,
+                        0,
+                        MTLOrigin { x: 0, y: 0, z: 0 },
+                        option,
                     );
                 }
             }
+            {
+                use objc2_metal::MTLCommandEncoder as _;
+                blit.endEncoding();
+            }
         }
-        let depth_after = if let (Some(d), Some(image)) = (draw.depth, depth.as_deref()) {
-            Some(self.download_depth(d, t.width, t.height, draw.scale, image, &depth_before)?)
-        } else {
-            None
-        };
-        // Only commit after all GPU work and both readbacks succeeded.
-        memory.write(t.addr, &after);
-        if let (Some(d), Some(bytes)) = (draw.depth, depth_after) {
-            memory.write(d.addr, &bytes);
+        self.encode_placed(&cb, &native, &state, draw.uniforms, draw.tables)
+            .map_err(exec)?;
+        // the depth's truth and the color's Managed sync, on the same buffer
+        {
+            let blit = cb
+                .blitCommandEncoder()
+                .ok_or_else(|| exec("readback encoder allocation"))?;
+            if let Some((index, _)) = depth_index {
+                let image = self.depths[index].image.clone();
+                let depth_plane = self.depths[index].depth_plane.clone();
+                let stencil_plane = self.depths[index].stencil_plane.clone();
+                let (dr, sr) = (self.depths[index].dr, self.depths[index].sr);
+                unsafe {
+                    for (buffer, row, option) in [
+                        (&depth_plane, dr, MTLBlitOption::DepthFromDepthStencil),
+                        (&stencil_plane, sr, MTLBlitOption::StencilFromDepthStencil),
+                    ] {
+                        blit.copyFromTexture_sourceSlice_sourceLevel_sourceOrigin_sourceSize_toBuffer_destinationOffset_destinationBytesPerRow_destinationBytesPerImage_options(
+                            &image,
+                            0,
+                            0,
+                            MTLOrigin { x: 0, y: 0, z: 0 },
+                            MTLSize { width: w as usize, height: h as usize, depth: 1 },
+                            buffer,
+                            0,
+                            row,
+                            row * h as usize,
+                            option,
+                        );
+                    }
+                }
+            }
+            unsafe { blit.synchronizeResource((*color).as_ref()); }
+            {
+                use objc2_metal::MTLCommandEncoder as _;
+                blit.endEncoding();
+            }
         }
-        self.sync_guest(t.addr, len);
+        cb.commit();
+        cb.waitUntilCompleted();
+        if cb.status() != MTLCommandBufferStatus::Completed {
+            self.failed = true;
+            return Err(exec("Metal draw failed; guest memory unchanged"));
+        }
+        self.ring.head = 0;
+        self.ring.live.clear();
+
+        // the readbacks run after the one wait: the color re-encoded into
+        // the surface's own bytes, the depth's planes decoded at the
+        // changed samples, both into guest memory (write-through)
+        let rgba = self.readback_rgba(&cb, color_index).map_err(exec)?;
+        self.write_back_rgba(memory, color_index, &rgba)
+            .map_err(exec)?;
+        if let Some((index, _)) = depth_index {
+            self.finish_depth(memory, index)?;
+        }
         cache.invalidate_range(t.addr, len);
         if let (Some(d), Some(n)) = (draw.depth, depth_len) {
-            self.sync_guest(d.addr, n);
             cache.invalidate_range(d.addr, n);
         }
         Ok(())
     }
+
     fn depth_planes(
         &self,
         w: u32,
@@ -358,137 +576,6 @@ impl HardwareMetal {
             std::ptr::write_bytes(s.contents().as_ptr() as *mut u8, 0, sr * h as usize);
         }
         Ok((d, s, dr, sr))
-    }
-    fn upload_depth(
-        &mut self,
-        d: GuestDepth,
-        nw: u32,
-        nh: u32,
-        scale: u32,
-        bytes: &[u8],
-    ) -> Result<Retained<ProtocolObject<dyn MTLTexture>>, CoherenceError> {
-        let (w, h) = (nw * scale, nh * scale);
-        let image = texture(
-            &self.device,
-            w,
-            h,
-            MTLPixelFormat::Depth32Float_Stencil8,
-            true,
-        )?;
-        let (depth, stencil, dr, sr) = self.depth_planes(w, h)?;
-        let maximum = if d.bytes == 2 { 65535.0 } else { 16777215.0 };
-        unsafe {
-            let depths = std::slice::from_raw_parts_mut(
-                depth.contents().as_ptr() as *mut u8,
-                dr * h as usize,
-            );
-            let stencils = std::slice::from_raw_parts_mut(
-                stencil.contents().as_ptr() as *mut u8,
-                sr * h as usize,
-            );
-            for y in 0..h {
-                for x in 0..w {
-                    let at = at(x / scale, y / scale, nw, d.bytes, d.tiled);
-                    let mut raw = [0u8; 4];
-                    raw[..d.bytes as usize].copy_from_slice(&bytes[at..at + d.bytes as usize]);
-                    let value =
-                        u32::from_le_bytes(raw) & if d.bytes == 2 { 65535 } else { 16777215 };
-                    let row = (h - 1 - y) as usize;
-                    depths[row * dr + x as usize * 4..row * dr + x as usize * 4 + 4]
-                        .copy_from_slice(&(value as f32 / maximum).to_le_bytes());
-                    stencils[row * sr + x as usize] = if d.bytes == 4 { raw[3] } else { 0 };
-                }
-            }
-        }
-        let cb = self
-            .queue
-            .commandBuffer()
-            .ok_or_else(|| exec("depth command allocation"))?;
-        let encoder = cb
-            .blitCommandEncoder()
-            .ok_or_else(|| exec("depth encoder allocation"))?;
-        unsafe {
-            for (buffer, row, option) in [
-                (&depth, dr, MTLBlitOption::DepthFromDepthStencil),
-                (&stencil, sr, MTLBlitOption::StencilFromDepthStencil),
-            ] {
-                encoder.copyFromBuffer_sourceOffset_sourceBytesPerRow_sourceBytesPerImage_sourceSize_toTexture_destinationSlice_destinationLevel_destinationOrigin_options(buffer,0,row,row*h as usize,MTLSize{width:w as usize,height:h as usize,depth:1},&image,0,0,MTLOrigin{x:0,y:0,z:0},option);
-            }
-        }
-        encoder.endEncoding();
-        wait(&cb).map_err(|e| {
-            self.failed = true;
-            e
-        })?;
-        Ok(image)
-    }
-    fn download_depth(
-        &mut self,
-        d: GuestDepth,
-        nw: u32,
-        nh: u32,
-        scale: u32,
-        image: &ProtocolObject<dyn MTLTexture>,
-        before: &[u8],
-    ) -> Result<Vec<u8>, CoherenceError> {
-        let (w, h) = (nw * scale, nh * scale);
-        let (depth, stencil, dr, sr) = self.depth_planes(w, h)?;
-        let cb = self
-            .queue
-            .commandBuffer()
-            .ok_or_else(|| exec("depth readback allocation"))?;
-        let encoder = cb
-            .blitCommandEncoder()
-            .ok_or_else(|| exec("depth readback encoder"))?;
-        unsafe {
-            for (buffer, row, option) in [
-                (&depth, dr, MTLBlitOption::DepthFromDepthStencil),
-                (&stencil, sr, MTLBlitOption::StencilFromDepthStencil),
-            ] {
-                encoder.copyFromTexture_sourceSlice_sourceLevel_sourceOrigin_sourceSize_toBuffer_destinationOffset_destinationBytesPerRow_destinationBytesPerImage_options(image,0,0,MTLOrigin{x:0,y:0,z:0},MTLSize{width:w as usize,height:h as usize,depth:1},buffer,0,row,row*h as usize,option);
-            }
-        }
-        encoder.endEncoding();
-        wait(&cb).map_err(|e| {
-            self.failed = true;
-            e
-        })?;
-        let mut out = before.to_vec();
-        let maximum = if d.bytes == 2 { 65535.0 } else { 16777215.0 };
-        unsafe {
-            let depths =
-                std::slice::from_raw_parts(depth.contents().as_ptr() as *const u8, dr * h as usize);
-            let stencils = std::slice::from_raw_parts(
-                stencil.contents().as_ptr() as *const u8,
-                sr * h as usize,
-            );
-            for y in 0..nh {
-                for x in 0..nw {
-                    let at = at(x, y, nw, d.bytes, d.tiled);
-                    let row = (h - 1 - (y * scale + scale / 2)) as usize;
-                    let col = (x * scale + scale / 2) as usize;
-                    let value = f32::from_le_bytes(
-                        depths[row * dr + col * 4..row * dr + col * 4 + 4]
-                            .try_into()
-                            .unwrap(),
-                    );
-                    let mut raw = [0u8; 4];
-                    raw[..d.bytes as usize].copy_from_slice(&before[at..at + d.bytes as usize]);
-                    let previous =
-                        u32::from_le_bytes(raw) & if d.bytes == 2 { 65535 } else { 16777215 };
-                    // Preserve exact guest bits if the GPU did not change the sample.
-                    if value.to_bits() != (previous as f32 / maximum).to_bits() {
-                        let encoded = (value.clamp(0.0, 1.0) * maximum) as u32;
-                        let n = if d.bytes == 2 { 2 } else { 3 };
-                        out[at..at + n].copy_from_slice(&encoded.to_le_bytes()[..n]);
-                    }
-                    if d.bytes == 4 {
-                        out[at + 3] = stencils[row * sr + col];
-                    }
-                }
-            }
-        }
-        Ok(out)
     }
 }
 
@@ -833,13 +920,17 @@ mod tests {
         )
         .unwrap();
         gpu.memory_fill(&mut memory, 0x1000, 0x1400, 0xFF00FF00, 4);
+        // H6: the fence drops the surface the fill touched; the frame's
+        // other residents stay (their own fences drop them)
         assert!(
             gpu.resources
                 .metal_hardware
                 .as_ref()
                 .unwrap()
                 .surfaces
-                .is_empty()
+                .iter()
+                .all(|s| !overlaps(0x1000, 0x1400 - 0x1000, s.addr, s.size())),
+            "the fill's fence drops the surface it touched"
         );
         let filled = super::super::super::bind_texture(
             &texture_registers,
@@ -865,7 +956,7 @@ mod tests {
             .unwrap();
         hw.check_surface(&mut memory, 0x1040, (8, 8), target.format, false)
             .unwrap();
-        hw.sync_guest(0x1050, 1);
+        hw.sync_guest(&mut memory, 0x1050, 1);
         assert!(hw.surfaces.is_empty(), "both overlapping views invalidated");
         let transfer = super::super::super::Transfer {
             input: 0x1000,

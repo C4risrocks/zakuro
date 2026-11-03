@@ -460,6 +460,8 @@ pub struct HardwareMetal {
     pub(crate) ring: Ring,
     /// the draw targets backed by the guest's memory (A4).
     pub(crate) surfaces: Vec<MetalSurface>,
+    /// the depth twins resident next to the surfaces (H6).
+    pub(crate) depths: Vec<coherence::MetalDepth>,
     pipelines: std::collections::HashMap<PipelineKey, Retained<ProtocolObject<dyn objc2_metal::MTLRenderPipelineState>>>,
     depth_states: std::collections::HashMap<PipelineKey, Retained<ProtocolObject<dyn objc2_metal::MTLDepthStencilState>>>,
     failed: bool,
@@ -506,7 +508,7 @@ impl HardwareMetal {
         // first, the batch's own defines grow it honestly when A4's real
         // draws land inside
         let ring = Ring::new(device.as_ref(), 8 << 20)?;
-        Ok(Self { device, queue, libraries, entries, ring, surfaces: Vec::new(), pipelines: Default::default(), depth_states: Default::default(), failed: false, pica_textures: Default::default(), pica_samplers: Default::default() })
+        Ok(Self { device, queue, libraries, entries, ring, surfaces: Vec::new(), depths: Vec::new(), pipelines: Default::default(), depth_states: Default::default(), failed: false, pica_textures: Default::default(), pica_samplers: Default::default() })
     }
 
     pub fn function(
@@ -929,6 +931,28 @@ impl HardwareMetal {
 
     pub fn draw_placed_state(&mut self, draw: &PlacedDraw<'_>, state: &RasterState,
         uniforms_words: &[u32], tables_words: &[u32]) -> Result<(), String> {
+        if self.failed { return Err("Metal backend failed; recreate before drawing".into()); }
+        let buffer = self.queue.commandBuffer().ok_or("the draw's command buffer")?;
+        self.encode_placed(&buffer, draw, state, uniforms_words, tables_words)?;
+        buffer.commit();
+        buffer.waitUntilCompleted();
+        self.ring.head = 0;
+        self.ring.live.clear();
+        if buffer.status() != objc2_metal::MTLCommandBufferStatus::Completed {
+            self.failed = true;
+            return Err("Metal draw execution failed; guest memory was not committed".into());
+        }
+        Ok(())
+    }
+
+    /// the draw encoded onto the caller's command buffer (H6): the
+    /// coherence's guest draw stages here too, so a guest draw and its
+    /// depth round-trips ride one submission and one wait. all previous
+    /// spans are retired — staging is per submission.
+    pub fn encode_placed(&mut self,
+        buffer: &ProtocolObject<dyn objc2_metal::MTLCommandBuffer>,
+        draw: &PlacedDraw<'_>, state: &RasterState,
+        uniforms_words: &[u32], tables_words: &[u32]) -> Result<(), String> {
         let key = &state.key;
         if self.failed { return Err("Metal backend failed; recreate before drawing".into()); }
 
@@ -1009,7 +1033,6 @@ impl HardwareMetal {
                 stencil.setClearStencil(0);
             }
         }
-        let buffer = self.queue.commandBuffer().expect("the command buffer");
         let encoder = unsafe { buffer.renderCommandEncoderWithDescriptor(&pass) }
             .expect("the draw's render encoder");
         unsafe {
@@ -1039,14 +1062,6 @@ impl HardwareMetal {
             );
             let encoder_ref: &AnyObject = encoder.as_ref();
             let _: () = objc2::msg_send![encoder_ref, endEncoding];
-        }
-        buffer.commit();
-        buffer.waitUntilCompleted();
-        self.ring.head = 0;
-        self.ring.live.clear();
-        if buffer.status() != objc2_metal::MTLCommandBufferStatus::Completed {
-            self.failed = true;
-            return Err("Metal draw execution failed; guest memory was not committed".into());
         }
         Ok(())
     }
@@ -1199,10 +1214,14 @@ fn key_fragment(key: &PipelineKey) -> [u32; FRAGMENT_CONSTANTS] {
 struct MetalSurface {
     texture: Retained<ProtocolObject<dyn objc2_metal::MTLTexture>>,
     addr: u32,
+    /// the guest's own rows: everything else about the surface (the
+    /// texture's dims, the write-back's sampling) scales off these
     width: u32,
     height: u32,
     format: ColorFormat,
     tiled: bool,
+    /// the rasterization scale the resident texture renders at
+    scale: u32,
     /// the guest's bytes the texture matched last.
     shadow: Vec<u8>,
 }
@@ -1242,37 +1261,76 @@ impl HardwareMetal {
     ) -> Result<(), String> {
         use objc2_metal::MTLTexture as _;
         let texture = self.surfaces[index].texture.clone();
-        let (width, height, format, tiled) = {
-            let surface = &self.surfaces[index];
-            (surface.width, surface.height, surface.format, surface.tiled)
-        };
-        let command=self.queue.commandBuffer().ok_or("Metal readback command allocation")?;
-        let encoder=command.blitCommandEncoder().ok_or("Metal readback encoder allocation")?;
-        unsafe { use objc2_metal::MTLBlitCommandEncoder as _; encoder.synchronizeResource((*texture).as_ref()); }
-        { use objc2_metal::MTLCommandEncoder as _; encoder.endEncoding(); }
-        command.commit(); command.waitUntilCompleted();
-        if command.status()!=objc2_metal::MTLCommandBufferStatus::Completed { self.failed=true; return Err("Metal readback failed".into()); }
-        let bpp = format.bytes_per_pixel();
-        // the RGBA read-back rows top-first
-        let mut rgba = vec![0u8; (width * height * 4) as usize];
+        let command = self.queue.commandBuffer().ok_or("Metal readback command allocation")?;
+        let encoder = command.blitCommandEncoder().ok_or("Metal readback encoder allocation")?;
+        unsafe {
+            use objc2_metal::MTLBlitCommandEncoder as _;
+            encoder.synchronizeResource((*texture).as_ref());
+        }
+        {
+            use objc2_metal::MTLCommandEncoder as _;
+            encoder.endEncoding();
+        }
+        command.commit();
+        command.waitUntilCompleted();
+        if command.status() != objc2_metal::MTLCommandBufferStatus::Completed {
+            self.failed = true;
+            return Err("Metal readback failed".into());
+        }
+        let rgba = self.readback_rgba(&command, index)?;
+        self.write_back_rgba(memory, index, &rgba)
+    }
+
+    /// the surface's drawn rows, read straight off the caller's already
+    /// waited command buffer (H6: the guest draw's readback rides the
+    /// draw's own buffer, no second submission).
+    fn readback_rgba(
+        &self,
+        buffer: &ProtocolObject<dyn objc2_metal::MTLCommandBuffer>,
+        index: usize,
+    ) -> Result<Vec<u8>, String> {
+        use objc2_metal::MTLTexture as _;
+        let _ = buffer;
+        let texture = self.surfaces[index].texture.clone();
+        let (w, h) = (texture.width(), texture.height());
+        let mut rgba = vec![0u8; w * h * 4];
         unsafe {
             texture.getBytes_bytesPerRow_fromRegion_mipmapLevel(
                 std::ptr::NonNull::from(rgba.as_mut_slice()).cast(),
-                (width * 4) as usize,
+                w * 4,
                 objc2_metal::MTLRegion {
                     origin: objc2_metal::MTLOrigin { x: 0, y: 0, z: 0 },
-                    size: objc2_metal::MTLSize {
-                        width: width as usize, height: height as usize, depth: 1,
-                    },
+                    size: objc2_metal::MTLSize { width: w, height: h, depth: 1 },
                 },
                 0,
             );
         }
-        // the guest's bytes: rows bottom-first, the pixels re-encoded
+        Ok(rgba)
+    }
+
+    /// the drawn rows re-encoded into the surface's own format and written
+    /// to guest memory — the Vulkan `store`'s shape, sampling the scale's
+    /// block centers on scaled surfaces (H6). the shadow carries what
+    /// memory holds now.
+    fn write_back_rgba<M: crate::GpuMemory>(
+        &mut self,
+        memory: &mut M,
+        index: usize,
+        rgba: &[u8],
+    ) -> Result<(), String> {
+        let (scale, width, height, format, tiled) = {
+            let surface = &self.surfaces[index];
+            (surface.scale, surface.width, surface.height, surface.format, surface.tiled)
+        };
+        let w = width * scale;
+        let h = height * scale;
+        let bpp = format.bytes_per_pixel();
         let mut bytes = vec![0u8; self.surfaces[index].size() as usize];
         for y in 0..height {
             for x in 0..width {
-                let at = (((height - 1 - y) * width + x) * 4) as usize;
+                let px = x * scale + scale / 2;
+                let py = y * scale + scale / 2;
+                let at = (((h - 1 - py) * w + px) * 4) as usize;
                 let out = if tiled {
                     crate::format::morton_offset(x, y, width, bpp as u32) as usize
                 } else {
@@ -1293,6 +1351,7 @@ impl HardwareMetal {
     /// when the bytes changed — the Vulkan `surface_rows`'s shape with the
     /// CPU decode (the shared `format.decode` + morton), the upload into
     /// the texture's flipped rows (the guest's rows run bottom first).
+    /// looks the surface up or makes it from the guest's rows (scale 1).
     fn check_surface<M: crate::GpuMemory>(
         &mut self,
         memory: &mut M,
@@ -1300,6 +1359,22 @@ impl HardwareMetal {
         (width, height): (u32, u32),
         format: ColorFormat,
         tiled: bool,
+    ) -> Result<usize, String> {
+        self.check_surface_at(memory, addr, (width, height), format, tiled, 1)
+    }
+
+    /// the same lookup at the draw's resolution scale (H6): the texture
+    /// mounts at the scaled dims, the shadow still holds the guest's own
+    /// bytes, and the load decodes into the scaled blocks — each texture
+    /// pixel reading the guest pixel it covers.
+    fn check_surface_at<M: crate::GpuMemory>(
+        &mut self,
+        memory: &mut M,
+        addr: u32,
+        (width, height): (u32, u32),
+        format: ColorFormat,
+        tiled: bool,
+        scale: u32,
     ) -> Result<usize, String> {
         use objc2_metal::{MTLStorageMode, MTLTextureDescriptor, MTLTextureUsage};
         coherence::validate_surface(addr, width, height, format.bytes_per_pixel() as u32, tiled)
@@ -1311,7 +1386,7 @@ impl HardwareMetal {
             .position(|surface| {
                 surface.addr == addr && surface.width == width
                     && surface.height == height && surface.format == format
-                    && surface.tiled == tiled
+                    && surface.tiled == tiled && surface.scale == scale
             });
         let index = match index {
             Some(index) => index,
@@ -1319,8 +1394,8 @@ impl HardwareMetal {
                 let descriptor = MTLTextureDescriptor::new();
                 descriptor.setPixelFormat(MTLPixelFormat::RGBA8Unorm);
                 unsafe {
-                    descriptor.setWidth(width as usize);
-                    descriptor.setHeight(height as usize);
+                    descriptor.setWidth((width * scale) as usize);
+                    descriptor.setHeight((height * scale) as usize);
                 }
                 descriptor.setUsage(MTLTextureUsage::RenderTarget | MTLTextureUsage::ShaderRead);
                 descriptor.setStorageMode(MTLStorageMode::Managed);
@@ -1333,6 +1408,7 @@ impl HardwareMetal {
                     height,
                     format,
                     tiled,
+                    scale,
                     shadow: Vec::new(),
                 });
                 self.surfaces.len() - 1
@@ -1340,29 +1416,27 @@ impl HardwareMetal {
         };
 
         // the shadow: the bytes when the texture matched. changed, they get
-        // read and decoded into the texture's flipped rows
+        // read and decoded into the texture's flipped rows, one guest pixel
+        // per scale-block
         let size = self.surfaces[index].size() as usize;
         let mut bytes = vec![0u8; size];
         memory.read(addr, &mut bytes);
         if !self.surfaces[index].shadows(&bytes) {
-            let texture = &self.surfaces[index];
-            let (w, h, bpp) = (
-                texture.width,
-                texture.height,
-                texture.format.bytes_per_pixel() as u32,
-            );
+            let decode = format;
+            let bpp = decode.bytes_per_pixel() as u32;
+            let (w, h) = (width * scale, height * scale);
             let mut texture_bytes = vec![0u8; (w * h * 4) as usize];
-            let decode = texture.format;
             let (w_us, h_us, bpp_us) = (w as usize, h as usize, bpp as usize);
-            for y in 0..h {
-                for x in 0..w {
-                    let at = if texture.tiled {
-                        crate::format::morton_offset(x, y, w, bpp) as usize
+            for ty in 0..h {
+                for tx in 0..w {
+                    let (gx, gy) = (tx / scale, ty / scale);
+                    let at = if tiled {
+                        crate::format::morton_offset(gx, gy, width, bpp) as usize
                     } else {
-                        ((y * w + x) * bpp) as usize
+                        ((gy * width + gx) * bpp) as usize
                     };
                     let rgba: [u8; 4] = decode.decode(&bytes[at..at + bpp_us]);
-                    let out = ((h_us - 1 - y as usize) * w_us + x as usize) * 4;
+                    let out = ((h_us - 1 - ty as usize) * w_us + tx as usize) * 4;
                     texture_bytes[out..out + 4].copy_from_slice(&rgba);
                 }
             }
@@ -1371,7 +1445,7 @@ impl HardwareMetal {
                 self.surfaces[index].texture.replaceRegion_mipmapLevel_withBytes_bytesPerRow(
                     objc2_metal::MTLRegion {
                         origin: objc2_metal::MTLOrigin { x: 0, y: 0, z: 0 },
-                        size: objc2_metal::MTLSize { width: w as usize, height: h as usize, depth: 1 },
+                        size: objc2_metal::MTLSize { width: w_us, height: h_us, depth: 1 },
                     },
                     0,
                     std::ptr::NonNull::from(texture_bytes.as_slice()).cast(),
@@ -1885,6 +1959,7 @@ mod tests {
             width: SIZE, height: SIZE,
             format: ColorFormat::Rgba8,
             tiled: false,
+            scale: 1,
             shadow: Vec::new(),
         });
 
