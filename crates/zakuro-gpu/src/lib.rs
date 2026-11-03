@@ -472,6 +472,34 @@ impl Gpu {
                 Err(error) => log::error!("the GPU could not transfer a buffer, {error}"),
             }
         }
+
+        // the Metal host's honest transfer: the coherence layer's own
+        // write-through path runs the same transfer.comp compute, and the
+        // guest's memory lands canonical after the run
+        #[cfg(all(feature = "metal", target_os = "macos"))]
+        if let Some(metal) = self.resources.metal_hardware.as_mut() {
+            let transfer = raster::Transfer {
+                input: input_base,
+                output: output_base,
+                input_width,
+                output_width,
+                output_height,
+                copy: (copy_width, copy_height),
+                scale: (scale_x, scale_y),
+                flip: flip_vertically,
+                input_linear,
+                output_tiled,
+                input_format,
+                output_format,
+            };
+            match metal.display_transfer(memory, &transfer) {
+                Ok(()) => {
+                    self.transfers += 1;
+                    return;
+                }
+                Err(error) => log::error!("the Metal host could not transfer a buffer, {error}"),
+            }
+        }
         // four bytes a pixel covers every format either side uses
         self.sync_memory(memory, input_base, input_width * input_height * 4);
         self.sync_memory(memory, output_base, output_width * output_height * 4);
