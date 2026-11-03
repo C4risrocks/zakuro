@@ -439,8 +439,9 @@ pub fn depth_pixel_format(float_depth: bool) -> MTLPixelFormat {
 }
 
 mod pica;
-mod coherence;
-pub use coherence::{GuestTarget, GuestDepth, GuestDraw, CoherenceError};
+pub(crate) mod coherence;
+pub(crate) use coherence::{GuestDepth, GuestDraw, GuestTarget};
+pub use coherence::CoherenceError;
 pub use pica::{OwnedTextureBinding, RasterState};
 
 /// the hardware raster's Metal state: device, queue, and the rack's MSL

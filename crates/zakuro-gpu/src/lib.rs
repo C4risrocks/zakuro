@@ -235,7 +235,7 @@ impl Gpu {
             transfers: 0,
             vertices_drawn: 0,
             busy: std::time::Duration::ZERO,
-            resources: raster::Resources::default(),
+            resources: raster::Resources::with_hosts(),
             interpolation: None,
             scout: None,
             scouting: false,
